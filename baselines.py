@@ -290,6 +290,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 raise ValueError(f"Unknown strategy: {strategy}")
 
             # Compose the full context with file separators
+            used_tokens = 0
             context_parts = []
             for file_path in selected_files:
                 if not file_path:
