@@ -118,7 +118,7 @@ def find_bm25_file(root_dir: str, prefix: str, suffix: str, min_lines: int = 10)
 
     return file_names[best_idx] if file_names else None
 
-def find_bm25_top_5_files(root_dir: str, prefix: str, suffix: str, min_lines: int = 10, no_of_files: int = 5) -> List[str]:
+def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: int = 10, no_of_files: int = 3) -> List[str]:
     """
     Select the top three files:
         - in the given language
@@ -280,8 +280,8 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 selected_files = [find_random_file(root_directory)]
             elif strategy == "bm25":
                 selected_files = [find_bm25_file(root_directory, datapoint['prefix'], datapoint['suffix'])]
-            elif strategy == "bm25_top_5_files":
-                selected_files = find_bm25_top_5_files(root_directory, datapoint['prefix'], datapoint['suffix'])
+            elif strategy == "bm25_top_3_files":
+                selected_files = find_bm25_top_3_files(root_directory, datapoint['prefix'], datapoint['suffix'])
             elif strategy == "recent":
                 recent_filenames = datapoint['modified']
                 file = find_random_recent_file(root_directory, recent_filenames)
