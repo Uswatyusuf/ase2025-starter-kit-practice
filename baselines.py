@@ -1,18 +1,18 @@
-
 from typing import List
 import csv
 import matplotlib.pyplot as plt
 import os
 import tiktoken
+import json
 
 import random
 import argparse
 import jsonlines
 import numpy as np
+import langchain_ollama
 
 from rank_bm25 import BM25Okapi
-
-
+from langchain_ollama import OllamaLLM
 from chunking import basic_ast_chunk_code
 
 argparser = argparse.ArgumentParser()
@@ -44,6 +44,17 @@ print(f"Running the {strategy} baseline for stage '{stage}'")
 FILE_SEP_SYMBOL = "<|file_sep|>"
 # format to compose context from a file
 FILE_COMPOSE_FORMAT = "{file_sep}{file_name}\n{file_content}"
+
+# Adds ollama for generating textual info
+
+SYSTEM_INSTRUCTION = """You are a professional software developer.
+
+Given a code snippet with a PREFIX and a SUFFIX, your task is to describe what the missing MIDDLE section of the code should do.
+
+Return a concise, high-level summary in 1-3 sentences.
+"""
+
+llm = OllamaLLM(model="gemma:2b")
 
 
 def prepare_bm25_str(s: str) -> list[str]:
@@ -453,6 +464,7 @@ if args.trim_suffix:
 predictions_file = os.path.join("predictions", f"{prediction_file_name}.jsonl")
 
 instance_id = 0
+descriptions_log_path = os.path.join("predictions", f"{language}-{stage}-{strategy}_descriptions.jsonl")
 with jsonlines.open(completion_points_file, 'r') as reader:
     with jsonlines.open(predictions_file, 'w') as writer:
         for instance_id, datapoint in enumerate(reader):
@@ -474,6 +486,52 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             elif strategy == "bm25_top_3_files":
                 selected_files = find_bm25_top_3_files(root_directory, datapoint['prefix'], datapoint['suffix'])
             elif strategy == "bm25_chunks":
+                top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
+                selected_files = [file_path for file_path, _ in top_chunks]
+                for file_path, chunk_content in top_chunks:
+                    clean_file_name = file_path[len(root_directory) + 1:]
+                    context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
+                                                              file_content=chunk_content)
+                    context_parts.append(context_part)
+                    used_tokens += estimate_tokens(context_part)
+                total_tokens_used = used_tokens
+            elif strategy == "bm25_chunks_text_info":
+                # STEP 1: Get original prefix/suffix
+                original_prefix = datapoint["prefix"]
+                original_suffix = datapoint["suffix"]
+
+                # STEP 2: Query LLM for a description
+                fill_prompt = f"""{SYSTEM_INSTRUCTION}
+
+                --- BEGIN PREFIX ---
+                {original_prefix}
+                --- END PREFIX ---
+
+                --- BEGIN SUFFIX ---
+                {original_suffix}
+                --- END SUFFIX ---
+
+                Summarize what the missing middle code should do.
+                """
+                try:
+                    middle_description = llm.invoke(fill_prompt).strip()
+                except Exception as e:
+                    print(f"LLM failed for instance {instance_id}: {e}")
+                    middle_description = "[LLM Description Unavailable]"
+                description_record = {
+                    "instance_id": instance_id,
+                    "repo": datapoint["repo"],
+                    "description": middle_description
+                }
+                with jsonlines.open(descriptions_log_path, 'a') as descriptions_writer:
+                    descriptions_writer.write(description_record)
+                comment_intro = "# The part requiring completion:"
+                description_comment = "\n".join(f"# {line}" for line in middle_description.splitlines())
+
+                # STEP 3: Prepend to prefix
+                prefix = f"{comment_intro}\n{description_comment}\n\n{original_prefix}"
+                suffix = original_suffix
+
                 top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
                 selected_files = [file_path for file_path, _ in top_chunks]
                 for file_path, chunk_content in top_chunks:
@@ -526,7 +584,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
 
-            if strategy not in ["bm25_chunks", "bm25_chunks_limited", "bm25_chunks_above_percentile"]:
+            if strategy not in ["bm25_chunks_text_info", "bm25_chunks_limited", "bm25_chunks_above_percentile"]:
                 for file_path in selected_files:
                     if not file_path:
                         continue
@@ -546,7 +604,10 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                         continue
 
             context = "".join(context_parts)
-            submission = {"context": context}
+            submission = {"context": context,
+                          "prefix": prefix,
+                          "suffix": suffix
+                          }
 
             # Add prefix/suffix if needed
             if args.trim_prefix:
@@ -557,8 +618,9 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             # print(f"Picked files: {[os.path.basename(f) for f in selected_files if f]}")
             # print(f"Total tokens: {used_tokens}")
             writer.write(submission)
-            submission["prefix"] = prefix
-            submission["suffix"] = suffix
+
+            print(description_record)
+
             prefix_suffix_tokens = estimate_tokens(prefix) + estimate_tokens(suffix)
 
             log_token_usage(
@@ -568,5 +630,4 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 token_count=total_tokens_used,
                 prefix_suffix_tokens=prefix_suffix_tokens
             )
-
         plot_token_usage_chart(token_log_path)
