@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import os
 import tiktoken
 import json
-
+import re
 import random
 import argparse
 import jsonlines
@@ -51,10 +51,10 @@ SYSTEM_INSTRUCTION = """You are a professional software developer.
 
 Given a code snippet with a PREFIX and a SUFFIX, your task is to describe what the missing MIDDLE section of the code should do.
 
-Return a concise, high-level summary in 1-3 sentences.
+Return a concise summary in 2 sentences.
 """
 
-llm = OllamaLLM(model="gemma:2b")
+llm = OllamaLLM(model="qwen3:1.7b")
 
 
 def prepare_bm25_str(s: str) -> list[str]:
@@ -278,7 +278,6 @@ def bm25_chunks_within_limit_sorted_low_to_high(
         chunk_tokens = len(enc.encode(context_part))
         if total_tokens + chunk_tokens > context_limit:
             break
-
         selected_chunks.append((file_path, chunk_content))
         context_parts.append(context_part)
         total_tokens += chunk_tokens
@@ -287,7 +286,6 @@ def bm25_chunks_within_limit_sorted_low_to_high(
             selected_chunks,
             key=lambda x: scores[all_chunks.index(x)]
         )
-
     return selected_chunks, total_tokens
 
 def bm25_chunks_above_percentile(
@@ -518,6 +516,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 except Exception as e:
                     print(f"LLM failed for instance {instance_id}: {e}")
                     middle_description = "[LLM Description Unavailable]"
+                middle_description = re.sub(r'<think>.*?</think>', '', middle_description, flags=re.DOTALL).strip()
                 description_record = {
                     "instance_id": instance_id,
                     "repo": datapoint["repo"],
