@@ -49,10 +49,19 @@ FILE_COMPOSE_FORMAT = "{file_sep}{file_name}\n{file_content}"
 
 SYSTEM_INSTRUCTION = """You are a professional software developer.
 
-Given a code snippet with a PREFIX and a SUFFIX, your task is to describe what the missing MIDDLE section of the code should do.
+You are given a PREFIX and a SUFFIX from a source file. Your job is to generate a short, subtle hint that nudges a fellow developer about what the missing code likely does.
 
-Return a concise summary in 2 sentences.
+Do not describe it fully. Do not repeat "the missing code". Just write a hint in natural, suggestive language — like a short inline comment.
+
+Examples:
+- Hint: Likely uses a loop to publish messages with priorities.
+- Hint: May publish messages using kombu.Producer with retry enabled.
+- Hint: Probably drains events and verifies the order.
+
+Keep it neutral, 2 short sentence, starting with 'Hint:'.
 """
+
+
 
 llm = OllamaLLM(model="qwen3:1.7b")
 
@@ -81,7 +90,6 @@ def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None
     return chunk_entries
 
 
-
 def find_random_file(root_dir: str, min_lines: int = 10) -> str:
     """
     Select a random file:
@@ -108,7 +116,6 @@ def find_random_file(root_dir: str, min_lines: int = 10) -> str:
                     # Optional: handle unreadable files
                     # print(f"Could not read {file_path}: {e}")
                     pass
-
     return random.choice(code_files) if code_files else None
 
 
@@ -509,8 +516,8 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 {original_suffix}
                 --- END SUFFIX ---
 
-                Summarize what the missing middle code should do.
-                """
+                Hint:"""
+
                 try:
                     middle_description = llm.invoke(fill_prompt).strip()
                 except Exception as e:
@@ -524,11 +531,10 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 }
                 with jsonlines.open(descriptions_log_path, 'a') as descriptions_writer:
                     descriptions_writer.write(description_record)
-                comment_intro = "# The part requiring completion:"
                 description_comment = "\n".join(f"# {line}" for line in middle_description.splitlines())
 
                 # STEP 3: Prepend to prefix
-                prefix = f"{comment_intro}\n{description_comment}\n\n{original_prefix}"
+                prefix = f"{original_prefix}\n\n{description_comment}"
                 suffix = original_suffix
 
                 top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
@@ -629,4 +635,5 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 token_count=total_tokens_used,
                 prefix_suffix_tokens=prefix_suffix_tokens
             )
+            print(description_comment)
         plot_token_usage_chart(token_log_path)
