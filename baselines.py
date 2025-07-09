@@ -47,7 +47,7 @@ FILE_COMPOSE_FORMAT = "{file_sep}{file_name}\n{file_content}"
 
 # Adds ollama for generating textual info
 
-SYSTEM_INSTRUCTION = """You are a professional software developer.
+SYSTEM_INSTRUCTION_MID = """You are a professional software developer.
 
 You are given a PREFIX and a SUFFIX from a source file. Your job is to generate a short, subtle hint that nudges a fellow developer about what the missing code likely does.
 
@@ -169,7 +169,7 @@ def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: in
     Select the top three files:
         - in the given language
         - with the highest BM25 score with the completion file
-        - in the given directory and its subdirectories
+        - in the given directory and its subdirectosetries
         - meeting length requirements
 
     :param no_of_files:
@@ -506,7 +506,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 original_suffix = datapoint["suffix"]
 
                 # STEP 2: Query LLM for a description
-                fill_prompt = f"""{SYSTEM_INSTRUCTION}
+                fill_prompt = f"""{SYSTEM_INSTRUCTION_MID}
 
                 --- BEGIN PREFIX ---
                 {original_prefix}
@@ -609,10 +609,26 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                         continue
 
             context = "".join(context_parts)
-            submission = {"context": context,
-                          "prefix": prefix,
-                          "suffix": suffix
-                          }
+            for key in ["context", "prefix", "suffix"]:
+                val = locals()[key]
+                if val is None:
+                    print(f"[ERROR] {key} is None at instance {instance_id}")
+                    val = ""
+                elif not isinstance(val, str):
+                    print(f"[ERROR] {key} is not string at instance {instance_id}")
+                    val = str(val)
+
+            submission = {
+                "context": context,
+                "prefix": prefix,
+                "suffix": suffix
+            }
+
+            if any(v == "" for v in submission.values()):
+                print(f"[WARNING] Empty field in instance {instance_id}")
+                continue
+
+            print(f"[OK] Wrote instance {instance_id}")
 
             # Add prefix/suffix if needed
             if args.trim_prefix:
@@ -624,8 +640,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             # print(f"Total tokens: {used_tokens}")
             writer.write(submission)
 
-            print(description_record)
-
             prefix_suffix_tokens = estimate_tokens(prefix) + estimate_tokens(suffix)
 
             log_token_usage(
@@ -635,5 +649,4 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 token_count=total_tokens_used,
                 prefix_suffix_tokens=prefix_suffix_tokens
             )
-            print(description_comment)
         plot_token_usage_chart(token_log_path)
