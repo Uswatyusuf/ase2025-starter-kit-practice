@@ -61,11 +61,14 @@ Examples:
 Keep it neutral, 2 short sentence, starting with 'Hint:'.
 """
 
-SYSTEM_INSTRUCTION_W_TARGET_FILE = """You are a professional software developer.
+SYSTEM_INSTRUCTION_W_TARGET_FILE = """You are an experienced software engineer.
 
-You are given a PREFIX and a SUFFIX from a source file. Your job is to create a brief description of what the file (a combination of the prefix and the suffix) is meant to do. 
+Below, you are given two partial code fragments: a PREFIX and a SUFFIX from the same source file. Together, these represent parts of a larger file.
 
-Just make it 2 sentences.
+Please write a brief, high-level description of the **purpose** of this file, based on the given code. Focus on describing what the file is supposed to do overall (its main functionality or role in the project).
+
+Keep your description short and clear (ideally 1-3 sentences).
+
 """
 
 
