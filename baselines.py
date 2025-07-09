@@ -54,13 +54,19 @@ You are given a PREFIX and a SUFFIX from a source file. Your job is to generate 
 Do not describe it fully. Do not repeat "the missing code". Just write a hint in natural, suggestive language — like a short inline comment.
 
 Examples:
-- Hint: Likely uses a loop to publish messages with priorities.
-- Hint: May publish messages using kombu.Producer with retry enabled.
-- Hint: Probably drains events and verifies the order.
+- Likely uses a loop to publish messages with priorities.
+- May publish messages using kombu.Producer with retry enabled.
+- Probably drains events and verifies the order.
 
 Keep it neutral, 2 short sentence, starting with 'Hint:'.
 """
 
+SYSTEM_INSTRUCTION_W_TARGET_FILE = """You are a professional software developer.
+
+You are given a PREFIX and a SUFFIX from a source file. Your job is to create a brief description of what the file (a combination of the prefix and the suffix) is meant to do. 
+
+Just make it 2 sentences.
+"""
 
 
 llm = OllamaLLM(model="qwen3:1.7b")
@@ -169,7 +175,7 @@ def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: in
     Select the top three files:
         - in the given language
         - with the highest BM25 score with the completion file
-        - in the given directory and its subdirectosetries
+        - in the given directory and its subdirectories
         - meeting length requirements
 
     :param no_of_files:
@@ -500,7 +506,52 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_parts.append(context_part)
                     used_tokens += estimate_tokens(context_part)
                 total_tokens_used = used_tokens
-            elif strategy == "bm25_chunks_text_info":
+            elif strategy == "bm25_chunks_target_file_text_info":
+                # STEP 1: Get original prefix/suffix
+                original_prefix = datapoint["prefix"]
+                original_suffix = datapoint["suffix"]
+
+                # STEP 2: Query LLM for a description
+                fill_prompt = f"""{SYSTEM_INSTRUCTION_MID}
+
+                                --- BEGIN PREFIX ---
+                                {original_prefix}
+                                --- END PREFIX ---
+
+                                --- BEGIN SUFFIX ---
+                                {original_suffix}
+                                --- END SUFFIX ---
+
+                                """
+
+                try:
+                    file_description = llm.invoke(fill_prompt).strip()
+                except Exception as e:
+                    print(f"LLM failed for instance {instance_id}: {e}")
+                    file_description = "[LLM Description Unavailable]"
+                file_description = re.sub(r'<think>.*?</think>', '', file_description, flags=re.DOTALL).strip()
+                description_record = {
+                    "instance_id": instance_id,
+                    "repo": datapoint["repo"],
+                    "description": file_description
+                }
+                with jsonlines.open(descriptions_log_path, 'a') as descriptions_writer:
+                    descriptions_writer.write(description_record)
+                description_comment = "\n".join(f"# {line}" for line in file_description.splitlines())
+
+                # STEP 3: Prepend to prefix
+                prefix = f"{description_comment}\n\n{original_prefix}"
+                suffix = original_suffix
+                top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
+                selected_files = [file_path for file_path, _ in top_chunks]
+                for file_path, chunk_content in top_chunks:
+                    clean_file_name = file_path[len(root_directory) + 1:]
+                    context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
+                                                              file_content=chunk_content)
+                    context_parts.append(context_part)
+                    used_tokens += estimate_tokens(context_part)
+                total_tokens_used = used_tokens
+            elif strategy == "bm25_chunks_text_info_hint":
                 # STEP 1: Get original prefix/suffix
                 original_prefix = datapoint["prefix"]
                 original_suffix = datapoint["suffix"]
@@ -516,7 +567,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 {original_suffix}
                 --- END SUFFIX ---
 
-                Hint:"""
+                """
 
                 try:
                     middle_description = llm.invoke(fill_prompt).strip()
@@ -589,7 +640,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
 
-            if strategy not in ["bm25_chunks_text_info", "bm25_chunks_limited", "bm25_chunks_above_percentile"]:
+            if strategy not in ["bm25_chunks_text_info_hint", "bm25_chunks_limited", "bm25_chunks_above_percentile"]:
                 for file_path in selected_files:
                     if not file_path:
                         continue
@@ -609,14 +660,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                         continue
 
             context = "".join(context_parts)
-            for key in ["context", "prefix", "suffix"]:
-                val = locals()[key]
-                if val is None:
-                    print(f"[ERROR] {key} is None at instance {instance_id}")
-                    val = ""
-                elif not isinstance(val, str):
-                    print(f"[ERROR] {key} is not string at instance {instance_id}")
-                    val = str(val)
+
 
             submission = {
                 "context": context,
@@ -624,11 +668,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 "suffix": suffix
             }
 
-            if any(v == "" for v in submission.values()):
-                print(f"[WARNING] Empty field in instance {instance_id}")
-                continue
-
-            print(f"[OK] Wrote instance {instance_id}")
 
             # Add prefix/suffix if needed
             if args.trim_prefix:
