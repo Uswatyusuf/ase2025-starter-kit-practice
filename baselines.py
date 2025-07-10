@@ -49,12 +49,12 @@ FILE_COMPOSE_FORMAT = "{file_sep}{file_name}\n{file_content}"
 
 SYSTEM_INSTRUCTION_MID = """You are a professional developer.
 
-Given the PREFIX and SUFFIX of a Python function or class, provide a **single-line comment** that hints at what the missing middle code likely does.
+Given the PREFIX and SUFFIX of a Python function or class, write a **single-line inline comment** that subtly hints at what the missing middle code is likely doing.
 
-The comment should sound like it's written in the code — suggestive, not explanatory. Avoid quotes. Do not include ‘Hint:’ or other meta-language.
+The comment should be natural, concise, and blend in with real code — suggestive, not explanatory. Avoid using quotes, colons, or meta-language like 'Hint:'.
 
-Respond with just the comment, like:
-# Sets the timeout value and reconnect logic for the Redis client.
+Only return the comment line, like:
+# Set timeout and retry policy for Redis connection.
 """
 
 SYSTEM_INSTRUCTION_W_TARGET_FILE = """You are an experienced software engineer.
@@ -64,28 +64,52 @@ Below, you are given two partial code fragments: a PREFIX and a SUFFIX from the 
 Please write a brief, high-level description of the **purpose** of this file, based on the given code. Focus on describing what the file is supposed to do overall (its main functionality or role in the project).
 
 Keep your description short and clear (ideally 1-3 sentences).
+Start the first sentence with: "The middle part might"
 
 """
 
 SYSTEM_INSTRUCTION_PREFIX = """You are an experienced software engineer.
 
-Below, you are given a partial code fragments: a PREFIX from a source file. This represents a part(the first half) of a larger file.
+You are given the PREFIX of a source file. This represents the first part of a larger file, with the rest missing.
 
-Please write a brief, high-level description of the **purpose** of this prefix. Focus on describing what this segment is supposed to do overall (its potential functionality or role in the file).
+Please provide a brief, high-level summary of what this segment appears to do. Focus on the purpose or setup it establishes for the rest of the file.
 
-Keep your description short and clear (ideally 1-3 sentences).
-
+Keep your description clear and concise (1–3 sentences).
 """
+
 
 SYSTEM_INSTRUCTION_SUFFIX = """You are an experienced software engineer.
 
-Below, you are given a partial code fragments: a SUFFIX from a source file. This represents a part(the first half) of a larger file.
+You are given the SUFFIX of a source file. This represents the ending portion of a larger file, with earlier parts missing.
 
-Please write a brief, high-level description of the **purpose** of this SUFFIX. Focus on describing what this segment is supposed to do overall (its potential functionality or role in the file).
+Write a brief, high-level summary of what this segment appears to complete or finalize. Focus on the file’s final behavior, result handling, or cleanup logic.
 
-Keep your description short and clear (ideally 1-3 sentences).
-
+Keep your description clear and concise (1–3 sentences).
 """
+
+SYSTEM_INSTRUCTION_BM25_QUERY = """You are a senior software developer completing a missing block of code.
+
+You're provided with a PREFIX and SUFFIX from a Python function or class. Your job is to analyze the two and write a **detailed, technically rich description** of what the missing middle code is supposed to do.
+
+Focus on:
+- The main task or goal of the middle section.
+- Specific methods, libraries, or components that are likely used.
+- Expected control flow (e.g., loops, conditionals).
+- Data passed between the prefix and suffix.
+- Any system-specific behavior or constraints (e.g., retries, serialization, priorities).
+
+Avoid:
+- Lists, bullet points, headings
+- Code formatting or syntax
+- Expected code structure
+- Example Implementation Logic
+- Overly abstract/general language like “some logic” or “handles behavior”
+
+Make the description clear and structured, like a brief implementation plan or comment block — this will be used as a **search query** to retrieve related code.
+
+Be precise and informative.
+"""
+
 
 llm = OllamaLLM(model="qwen3:8b")
 
@@ -259,6 +283,34 @@ def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: 
 
     reversed_top_indices = top_indices[::-1]
 
+    return [all_chunks[i] for i in reversed_top_indices]
+
+def bm25_top_n_chunks_with_description(
+    root_dir: str,
+    bm25_middle_description: str,
+    ext: str,
+    top_k: int = 5
+) -> list[tuple[str, str]]:
+    all_chunks = []
+    chunk_cache = {}
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.endswith(ext):
+                file_path = os.path.join(dirpath, filename)
+                all_chunks.extend(get_chunks_for_file(file_path, chunk_cache))
+
+    if not all_chunks:
+        return []
+
+    chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
+    print(bm25_middle_description)
+    query = prepare_bm25_str(bm25_middle_description)
+
+    bm25 = BM25Okapi(chunk_texts)
+    scores = bm25.get_scores(query)
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+
+    reversed_top_indices = top_indices[::-1]
     return [all_chunks[i] for i in reversed_top_indices]
 
 
@@ -524,6 +576,92 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_parts.append(context_part)
                     used_tokens += estimate_tokens(context_part)
                 total_tokens_used = used_tokens
+            elif strategy == "bm25_chunks_text_info_mid_hint_no_other_context":
+                # STEP 1: Get original prefix/suffix
+                original_prefix = datapoint["prefix"]
+                original_suffix = datapoint["suffix"]
+
+                # STEP 2: Query LLM for a description
+                fill_prompt = f"""{SYSTEM_INSTRUCTION_MID}
+
+                --- BEGIN PREFIX ---
+                {original_prefix}
+                --- END PREFIX ---
+
+                --- BEGIN SUFFIX ---
+                {original_suffix}
+                --- END SUFFIX ---
+
+                """
+
+                try:
+                    middle_description = llm.invoke(fill_prompt).strip()
+                    # Clean up stray outer quotes if present
+                    if middle_description.startswith('"') and middle_description.endswith('"'):
+                        middle_description = middle_description[1:-1]
+
+                except Exception as e:
+                    print(f"LLM failed for instance {instance_id}: {e}")
+                    middle_description = "[LLM Description Unavailable]"
+                middle_description = re.sub(r'<think>.*?</think>', '', middle_description, flags=re.DOTALL).strip()
+                description_record = {
+                    "instance_id": instance_id,
+                    "repo": datapoint["repo"],
+                    "description": middle_description
+                }
+                with jsonlines.open(descriptions_log_path, 'a') as descriptions_writer:
+                    descriptions_writer.write(description_record)
+                description_comment = "\n".join(f"# {line}" for line in middle_description.splitlines())
+
+                # STEP 3: Prepend to prefix
+                prefix = f"Hint: The missing part might; {description_comment}\n\n{original_prefix}"
+                suffix = original_suffix
+
+                top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
+                selected_files = [file_path for file_path, _ in top_chunks]
+                for file_path, chunk_content in top_chunks:
+                    clean_file_name = file_path[len(root_directory) + 1:]
+                    context_part = ""
+                    context_parts.append(context_part)
+                    used_tokens += estimate_tokens(context_part)
+                total_tokens_used = used_tokens
+            elif strategy == "bm25_chunks_mid_desc_bm25_query":
+                # STEP 1: Get original prefix/suffix
+                original_prefix = datapoint["prefix"]
+                original_suffix = datapoint["suffix"]
+
+                # STEP 2: Query LLM for a description
+                fill_prompt = f"""{SYSTEM_INSTRUCTION_BM25_QUERY}
+
+                    --- BEGIN PREFIX ---
+                    {original_prefix}
+                    --- END PREFIX ---
+
+                    --- BEGIN SUFFIX ---
+                    {original_suffix}
+                    --- END SUFFIX ---
+
+                    """
+
+                try:
+                    bm25_middle_description = llm.invoke(fill_prompt).strip()
+                    # Clean up stray outer quotes if present
+                    if bm25_middle_description.startswith('"') and bm25_middle_description.endswith('"'):
+                        bm25_middle_description = bm25_middle_description[1:-1]
+
+                except Exception as e:
+                    print(f"LLM failed for instance {instance_id}: {e}")
+                    bm25_middle_description = "[LLM Description Unavailable]"
+                bm25_middle_description = re.sub(r'<think>.*?</think>', '', bm25_middle_description, flags=re.DOTALL).strip()
+                top_chunks = bm25_top_n_chunks_with_description(root_directory, bm25_middle_description, extension)
+                selected_files = [file_path for file_path, _ in top_chunks]
+                for file_path, chunk_content in top_chunks:
+                    clean_file_name = file_path[len(root_directory) + 1:]
+                    context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
+                                                              file_content=chunk_content)
+                    context_parts.append(context_part)
+                    used_tokens += estimate_tokens(context_part)
+                total_tokens_used = used_tokens
             elif strategy == "bm25_chunks_target_file_text_info":
                 # STEP 1: Get original prefix/suffix
                 original_prefix = datapoint["prefix"]
@@ -619,7 +757,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_parts.append(context_part)
                     used_tokens += estimate_tokens(context_part)
                 total_tokens_used = used_tokens
-            elif strategy == "bm25_chunks_text_info_px_mid_sx":
+            elif strategy == "bm25_chunks_text_info_px_sx":
                 # STEP 1: Get original prefix/suffix
                 original_prefix = datapoint["prefix"]
                 original_suffix = datapoint["suffix"]
@@ -655,36 +793,33 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
                 try:
                     prefix_description = llm.invoke(prefix_prompt).strip()
-                    middle_description = llm.invoke(fill_prompt).strip()
+                   # middle_description = llm.invoke(fill_prompt).strip()
                     suffix_description = llm.invoke(suffix_prompt).strip()
-                    # Clean up stray outer quotes if present
-                    if middle_description.startswith('"') and middle_description.endswith('"'):
-                        middle_description = middle_description[1:-1]
+
 
                 except Exception as e:
                     print(f"LLM failed for instance {instance_id}: {e}")
-                    middle_description = "[LLM Description Unavailable]"
+                    #middle_description = "[LLM Description Unavailable]"
                     prefix_description = "[LLM Description Unavailable]"
                     suffix_description = "[LLM Description Unavailable]"
                 prefix_description = re.sub(r'<think>.*?</think>', '', prefix_description, flags=re.DOTALL).strip()
-                middle_description = re.sub(r'<think>.*?</think>', '', middle_description, flags=re.DOTALL).strip()
+                #middle_description = re.sub(r'<think>.*?</think>', '', middle_description, flags=re.DOTALL).strip()
                 suffix_description = re.sub(r'<think>.*?</think>', '', suffix_description, flags=re.DOTALL).strip()
                 description_record = {
                     "instance_id": instance_id,
                     "repo": datapoint["repo"],
                     "px_description": prefix_description,
-                    "description": middle_description,
                     "sx_description": suffix_description
                 }
                 with jsonlines.open(descriptions_log_path, 'a') as descriptions_writer:
                     descriptions_writer.write(description_record)
                 px_description_comment = "\n".join(f"# {line}" for line in prefix_description.splitlines())
-                mid_description_comment = "\n".join(f"# {line}" for line in middle_description.splitlines())
+                #mid_description_comment = "\n".join(f"# {line}" for line in middle_description.splitlines())
                 sx_description_comment = "\n".join(f"# {line}" for line in suffix_description.splitlines())
 
                 # STEP 3: Prepend to prefix
                 prefix = f"{px_description_comment}\n\n{original_prefix}"
-                suffix = f"Hint: {mid_description_comment}\n\n{sx_description_comment}\n\n{original_suffix}"
+                suffix = f"{sx_description_comment}\n\n{original_suffix}"
 
                 top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
                 selected_files = [file_path for file_path, _ in top_chunks]
@@ -738,7 +873,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
 
-            if strategy not in ["bm25_chunks_text_info_hint", "bm25_chunks_limited", "bm25_chunks_above_percentile", "bm25_chunks_target_file_text_info", "bm25_chunks_text_info_px_mid_sx"]:
+            if strategy not in ["bm25_chunks_text_info_hint", "bm25_chunks_limited", "bm25_chunks_above_percentile", "bm25_chunks_target_file_text_info", "bm25_chunks_text_info_px_mid_sx", "bm25_chunks_text_info_mid_hint_no_other_context"]:
                 for file_path in selected_files:
                     if not file_path:
                         continue
