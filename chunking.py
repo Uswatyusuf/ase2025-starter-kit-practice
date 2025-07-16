@@ -1,5 +1,6 @@
 from tree_sitter import Language,Parser
 import tree_sitter_python as tspython
+import tree_sitter_kotlin as ts_kotlin
 
 file_path = "data/repositories-python-practice/celery__kombu-7f9674419b585921b1da4ecbd5f3dc203891955e/kombu/utils/eventio.py"
 
@@ -54,9 +55,15 @@ with open(file_path, 'r', encoding='utf-8') as f:
 #     ]
 
 
-def basic_ast_chunk_code(code: str) -> list[str]:
+def basic_ast_chunk_code(code: str, lang: str) -> list[str]:
+    global parser
     PY_LANGUAGE = Language(tspython.language())
-    parser = Parser(PY_LANGUAGE)
+    KT_LANGUAGE = Language (ts_kotlin.language())
+    print("Language; ", lang)
+    if lang == "python":
+        parser = Parser(PY_LANGUAGE)
+    elif lang == "kotlin":
+        parser = Parser(KT_LANGUAGE)
     code_bytes = code.encode("utf-8")
     tree = parser.parse(code_bytes)
     root = tree.root_node
@@ -108,7 +115,8 @@ def print_ast_structure(code: str):
         print(f"Text:\n{node_text}")
         print()
 
-chunks = basic_ast_chunk_code(code)
+language = "python"
+chunks = basic_ast_chunk_code(code, language)
 print_ast_structure(code)
 
 
