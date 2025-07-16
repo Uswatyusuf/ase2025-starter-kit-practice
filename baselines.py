@@ -1,15 +1,14 @@
+from dataclasses import dataclass
 from typing import List
 import csv
 import matplotlib.pyplot as plt
-import os
 import tiktoken
-import json
-import re
 import random
 import argparse
-import jsonlines
+import os, jsonlines, concurrent.futures, re
+from tqdm import tqdm
 import numpy as np
-import langchain_ollama
+
 
 from rank_bm25 import BM25Okapi
 from langchain_ollama import OllamaLLM
@@ -49,12 +48,18 @@ FILE_COMPOSE_FORMAT = "{file_sep}{file_name}\n{file_content}"
 
 SYSTEM_INSTRUCTION_MID = """You are a professional developer.
 
-Given the PREFIX and SUFFIX of a Python function or class, write a **single-line inline comment** that subtly hints at what the missing middle code is likely doing.
+Below, you are given two partial code fragments: a PREFIX and a SUFFIX from the same source file. Together, these represent parts of a larger file.
 
-The comment should be natural, concise, and blend in with real code — suggestive, not explanatory. Avoid using quotes, colons, or meta-language like 'Hint:'.
+Please write a high-level description that subtly hints at what the missing middle code is likely doing.
 
-Only return the comment line, like:
-# Set timeout and retry policy for Redis connection.
+Focus on **specific actions** the code performs, such as initializing connections, creating data structures, or invoking key functions. Include any **key purposes or behaviors**, such as validating workflows or testing performance characteristics.
+
+Avoid using quotes, colons, or meta-language like 'Hint:'.
+
+Keep your description clear and concise (ideally 1-2 sentences).
+
+Start your sentence with "The part requiring completion" followed by its **likely actions and objectives**.
+
 """
 
 SYSTEM_INSTRUCTION_W_TARGET_FILE = """You are an experienced software engineer.
@@ -64,7 +69,6 @@ Below, you are given two partial code fragments: a PREFIX and a SUFFIX from the 
 Please write a brief, high-level description of the **purpose** of this file, based on the given code. Focus on describing what the file is supposed to do overall (its main functionality or role in the project).
 
 Keep your description short and clear (ideally 1-3 sentences).
-Start the first sentence with: "The middle part might"
 
 """
 
@@ -74,7 +78,9 @@ You are given the PREFIX of a source file. This represents the first part of a l
 
 Please provide a brief, high-level summary of what this segment appears to do. Focus on the purpose or setup it establishes for the rest of the file.
 
-Keep your description clear and concise (1–3 sentences).
+Keep your description clear and concise in just a sentence.
+
+Start your sentence with "This segment" followed by its function/ use.
 """
 
 
@@ -84,12 +90,14 @@ You are given the SUFFIX of a source file. This represents the ending portion of
 
 Write a brief, high-level summary of what this segment appears to complete or finalize. Focus on the file’s final behavior, result handling, or cleanup logic.
 
-Keep your description clear and concise (1–3 sentences).
+Keep your description clear and concise in just a sentence.
+
+Start your sentence with "This segment" followed by its function/ use.
 """
 
 SYSTEM_INSTRUCTION_BM25_QUERY = """You are a senior software developer completing a missing block of code.
 
-You're provided with a PREFIX and SUFFIX from a Python function or class. Your job is to analyze the two and write a **detailed, technically rich description** of what the missing middle code is supposed to do.
+You're provided with a PREFIX and SUFFIX from a file. Your job is to analyze the two and write a **detailed, technically rich description** of what the missing middle code is supposed to do.
 
 Focus on:
 - The main task or goal of the middle section.
@@ -110,13 +118,119 @@ Make the description clear and structured, like a brief implementation plan or c
 Be precise and informative.
 """
 
+SYSTEM_INSTRUCTION_CODE_GEN = """
+You are a professional software developer.
 
-llm = OllamaLLM(model="qwen3:8b")
+You are given:
+- A PREFIX and a SUFFIX from the same source file.
+- CONTEXT from other relevant files in the same repository.
+
+Your task is to generate the missing middle code between the PREFIX and SUFFIX.
+Use the CONTEXT to ensure consistency, correctness, and completeness.
+"""
 
 
-def prepare_bm25_str(s: str) -> list[str]:
-    return "".join(c if c.isalnum() else " " for c in s.lower()).split()
 
+
+llm = OllamaLLM(model="qwen3:8b", temperature=0)
+
+llm_code_completion = OllamaLLM(model="JetBrains/Mellum-4b-sft-python")
+
+# def prepare_bm25_str(s: str) -> list[str]:
+#     return "".join(c if c.isalnum() else " " for c in s.lower()).split()
+
+# ---------- File Description Caching ----------
+
+def load_file_description_cache(path):
+    if os.path.exists(path):
+        with jsonlines.open(path, 'r') as reader:
+            return {r['file_path']: r['description'] for r in reader}
+    return {}
+
+def save_file_description_cache(path, description_cache):
+    with jsonlines.open(path, 'w') as writer:
+        for file_path, description in description_cache.items():
+            writer.write({'file_path': file_path, 'description': description})
+
+# ---------- Multi-threaded File Description Generation ----------
+
+def batch_describe_files(file_paths, llm, max_workers=8):
+    def describe(file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            prompt = f"""You are a senior software developer.
+
+Below is the full content of a file from a large codebase. 
+Summarize what this file does including its main responsibilities, behaviors, and the kinds of objects/functions it defines.
+
+Be concise but informative. 
+Your response should be between (1-3) sentences.
+Avoid generic phrases.
+--- FILE ---
+{content}
+--- END FILE ---
+"""
+            response = llm.invoke(prompt).strip()
+            # ✅ Remove anything within <think>...</think> tags
+            cleaned_response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+            return file_path, cleaned_response
+        except Exception as e:
+            print(f"Failed describing {file_path}: {e}")
+            return file_path, "[No description available]"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(tqdm(executor.map(describe, file_paths), total=len(file_paths)))
+    return {file_path: desc for file_path, desc in results}
+
+
+# ---------- BM25 Efficient Retrieval ----------
+
+def bm25_top_n_chunks_with_cached_desc(
+    root_dir, prefix, suffix, ext,  desc_cache_path, top_k=5, max_lines=20
+):
+    description_cache = load_file_description_cache(desc_cache_path)
+
+    file_paths = []
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.endswith(ext):
+                file_path = os.path.join(dirpath, filename)
+                try:
+                    with open(file_path, 'r') as f:
+                        if sum(1 for _ in f) > max_lines:
+                            file_paths.append(file_path)
+                except: pass
+
+    uncached_files = [f for f in file_paths if f not in description_cache]
+    if uncached_files:
+        desc_updates = batch_describe_files(uncached_files, llm)
+        description_cache.update(desc_updates)
+        save_file_description_cache(desc_cache_path, description_cache)
+
+    all_chunks = []
+    for file_path in file_paths:
+        desc = description_cache[file_path]
+        with open(file_path, 'r') as f:
+            content = f.read()
+        chunks = basic_ast_chunk_code(content, language)
+        all_chunks.extend([(file_path, c, desc) for c in chunks if len(c.splitlines()) > 5])
+
+    if not all_chunks: return []
+
+    bm25 = BM25Okapi([prepare_bm25_str(c) for _, c, _ in all_chunks])
+    query = prepare_bm25_str(prefix + ' ' + suffix)
+    scores = bm25.get_scores(query)
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+    # Reverse the order to go from lowest of top 3 to highest
+    reversed_top_indices = top_indices[::-1]
+
+    return [all_chunks[i] for i in reversed_top_indices]
+
+# ---------- Utilities ----------
+
+def prepare_bm25_str(s):
+    return re.sub(r'[^a-zA-Z0-9]', ' ', s.lower()).split()
 
 def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None) -> list[tuple[str, str]]:
     if file_path in chunk_cache:
@@ -126,7 +240,7 @@ def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None
             content = f.read()
     except Exception:
         return []
-    chunks = basic_ast_chunk_code(content)
+    chunks = basic_ast_chunk_code(content, language)
     chunk_entries = [(file_path, chunk) for chunk in chunks]
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
@@ -134,6 +248,53 @@ def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None
         with open(debug_file, 'w', encoding='utf-8') as f:
             for i, (_, chunk) in enumerate(chunk_entries):
                 f.write(f"--- Chunk {i+1} ---\n{chunk.strip()}\n\n")
+    chunk_cache[file_path] = chunk_entries
+    return chunk_entries
+
+
+def get_chunks_for_file_with_desc(
+    file_path: str,
+    chunk_cache: dict,
+    description_cache: dict,
+    debug_dir: str = None
+) -> list[tuple[str, str, str]]:
+    """
+    Breaks a file into AST-based chunks and attaches a file-level description to each chunk.
+    Returns list of (file_path, chunk_text, file_description).
+    """
+    if file_path in chunk_cache:
+        return chunk_cache[file_path]
+
+    # Try to read file
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}")
+        return []
+
+    # Retrieve or generate file-level description
+    if file_path in description_cache:
+        current_file_desc = description_cache[file_path]
+    else:
+        current_file_desc = describe_file(file_path)
+        description_cache[file_path] = current_file_desc
+
+    current_file_desc = re.sub(r'<think>.*?</think>', '', current_file_desc, flags=re.DOTALL).strip()
+    # Chunk the file and attach description
+    chunks = basic_ast_chunk_code(content, language)
+    chunk_entries = [(file_path, chunk, current_file_desc) for chunk in chunks]
+
+    # Optionally write debug view of chunks
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        debug_file = os.path.join(debug_dir, os.path.basename(file_path) + ".chunks.txt")
+        with open(debug_file, 'w', encoding='utf-8') as f:
+            f.write(f"# 📄 File Description:\n# {current_file_desc.strip()}\n\n")
+            for i, (_, chunk, _) in enumerate(chunk_entries):
+                f.write(f"--- Chunk {i + 1} ---\n{chunk.strip()}\n\n")
+
+    # Cache results
     chunk_cache[file_path] = chunk_entries
     return chunk_entries
 
@@ -212,6 +373,34 @@ def find_bm25_file(root_dir: str, prefix: str, suffix: str, min_lines: int = 10)
     return file_names[best_idx] if file_names else None
 
 
+def describe_file(file_path: str) -> str:
+    """
+    Uses the LLM to generate a description for what the whole file does.
+    """
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    file_desc_prompt = f"""You are a senior software developer.
+
+Below is the full content of a file from a large codebase. 
+Summarize what this file does including its main responsibilities, behaviors, and the kinds of objects/functions it defines.
+
+Be concise but informative. 
+Your response should be between (1-3) sentences.
+Avoid generic phrases.
+
+--- BEGIN FILE ---
+{content}
+--- END FILE ---
+"""
+    try:
+        return llm.invoke(file_desc_prompt).strip()
+    except Exception as e:
+        print(f"Failed to describe {file_path}: {e}")
+        return "[No description available]"
+
+
+
 def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: int = 10, no_of_files: int = 3) -> List[str]:
     """
     Select the top three files:
@@ -285,7 +474,46 @@ def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: 
 
     return [all_chunks[i] for i in reversed_top_indices]
 
-def bm25_top_n_chunks_with_description(
+def bm25_top_n_chunks_attached_with_file_desc(
+    root_dir: str,
+    prefix: str,
+    suffix: str,
+    ext: str,
+    top_k: int = 3
+) -> list[tuple[str, str, str]]:
+    """
+    Retrieves the top-k BM25-matching chunks, each with its file-level description.
+    Returns a list of (file_path, chunk_content, file_description).
+    """
+    all_chunks = []  # type: list[tuple[str, str, str]]
+    chunk_cache = {}
+    description_cache = {}
+
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.endswith(ext):
+                file_path = os.path.join(dirpath, filename)
+                chunks_with_desc = get_chunks_for_file_with_desc(file_path, chunk_cache, description_cache)
+                all_chunks.extend(chunks_with_desc)
+
+    if not all_chunks:
+        return []
+
+    # Compute BM25 scores over the chunks only (ignore file descriptions for ranking)
+    chunk_texts = [prepare_bm25_str(chunk) for _, chunk, _ in all_chunks]
+    query = prepare_bm25_str(prefix + " " + suffix)
+
+    bm25 = BM25Okapi(chunk_texts)
+    scores = bm25.get_scores(query)
+
+    # Get top-k indices and reverse (if desired)
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+    reversed_top_indices = top_indices[::-1]
+
+    return [all_chunks[i] for i in reversed_top_indices]
+
+
+def bm25_top_n_chunks_with_missing_code_description(
     root_dir: str,
     bm25_middle_description: str,
     ext: str,
@@ -465,7 +693,6 @@ def find_random_recent_file(root_dir: str, recent_filenames: list[str], min_line
                 pass
     return random.choice(code_files) if code_files else None
 
-
 def trim_prefix(prefix: str):
     prefix_lines = prefix.split("\n")
     if len(prefix_lines) > 10:
@@ -529,9 +756,10 @@ def plot_token_usage_chart(token_log_path: str):
     plt.savefig("predictions/token_chart.png")
     plt.show()
 
+
+
 # Define the log path
 token_log_path = os.path.join("predictions", f"{language}-{stage}-{strategy}_token_usage.csv")
-
 
 # Path to the file with completion points
 completion_points_file = os.path.join("data", f"{language}-{stage}.jsonl")
@@ -653,7 +881,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     print(f"LLM failed for instance {instance_id}: {e}")
                     bm25_middle_description = "[LLM Description Unavailable]"
                 bm25_middle_description = re.sub(r'<think>.*?</think>', '', bm25_middle_description, flags=re.DOTALL).strip()
-                top_chunks = bm25_top_n_chunks_with_description(root_directory, bm25_middle_description, extension)
+                top_chunks = bm25_top_n_chunks_with_missing_code_description(root_directory, bm25_middle_description, extension)
                 selected_files = [file_path for file_path, _ in top_chunks]
                 for file_path, chunk_content in top_chunks:
                     clean_file_name = file_path[len(root_directory) + 1:]
@@ -703,7 +931,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 for file_path, chunk_content in top_chunks:
                     clean_file_name = file_path[len(root_directory) + 1:]
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
-                                                              file_content=chunk_content)
+                                                           file_content=chunk_content)
                     context_parts.append(context_part)
                     used_tokens += estimate_tokens(context_part)
                 total_tokens_used = used_tokens
@@ -745,7 +973,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 description_comment = "\n".join(f"# {line}" for line in middle_description.splitlines())
 
                 # STEP 3: Prepend to prefix
-                prefix = f"Hint: The missing part might; {description_comment}\n\n{original_prefix}"
+                prefix = f"{description_comment}\n\n{original_prefix}"
                 suffix = original_suffix
 
                 top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
@@ -757,7 +985,67 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_parts.append(context_part)
                     used_tokens += estimate_tokens(context_part)
                 total_tokens_used = used_tokens
-            elif strategy == "bm25_chunks_text_info_px_sx":
+            elif strategy == "bm25_chunks_target_file_and_mis_code_text_info":
+                # STEP 1: Get original prefix/suffix
+                original_prefix = datapoint["prefix"]
+                original_suffix = datapoint["suffix"]
+
+                # STEP 2: Query LLM for a description
+                target_file_prompt = f"""{SYSTEM_INSTRUCTION_W_TARGET_FILE}
+
+                                --- BEGIN PREFIX ---
+                                {original_prefix}
+                                --- END PREFIX ---
+
+                                --- BEGIN SUFFIX ---
+                                {original_suffix}
+                                --- END SUFFIX ---
+
+                                """
+                mis_code_prompt = f"""{SYSTEM_INSTRUCTION_MID}
+
+                                --- BEGIN PREFIX ---
+                                {original_prefix}
+                                --- END PREFIX ---
+
+                                --- BEGIN SUFFIX ---
+                                {original_suffix}
+                                --- END SUFFIX ---
+
+                                """
+                try:
+                    file_description = llm.invoke(target_file_prompt).strip()
+                    mis_code_description = llm.invoke(mis_code_prompt).strip()
+                except Exception as e:
+                    print(f"LLM failed for instance {instance_id}: {e}")
+                    file_description = "[LLM Description Unavailable]"
+                    mis_code_description = "[LLM Description Unavailable]"
+                file_description = re.sub(r'<think>.*?</think>', '', file_description, flags=re.DOTALL).strip()
+                mis_code_description = re.sub(r'<think>.*?</think>', '', mis_code_description, flags=re.DOTALL).strip()
+                description_record = {
+                    "instance_id": instance_id,
+                    "repo": datapoint["repo"],
+                    "file_description": file_description,
+                    "mis_code_description": mis_code_description
+                }
+                with jsonlines.open(descriptions_log_path, 'a') as descriptions_writer:
+                    descriptions_writer.write(description_record)
+                file_description_comment = "\n".join(f"# {line}" for line in file_description.splitlines())
+                mis_code_description_comment = "\n".join(f"# {line}" for line in mis_code_description.splitlines())
+                # STEP 3: Prepend to prefix
+                prefix = f"{file_description_comment}\n\n{mis_code_description_comment}\n\n{original_prefix}"
+                suffix = f"{original_suffix}"
+                top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
+                selected_files = [file_path for file_path, _ in top_chunks]
+                for file_path, chunk_content in top_chunks:
+                    clean_file_name = file_path[len(root_directory) + 1:]
+                    context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
+
+                                                           file_content=chunk_content)
+                    context_parts.append(context_part)
+                    used_tokens += estimate_tokens(context_part)
+                total_tokens_used = used_tokens
+            elif strategy == "bm25_chunks_text_info_px_mid_sx":
                 # STEP 1: Get original prefix/suffix
                 original_prefix = datapoint["prefix"]
                 original_suffix = datapoint["suffix"]
@@ -793,33 +1081,34 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
                 try:
                     prefix_description = llm.invoke(prefix_prompt).strip()
-                   # middle_description = llm.invoke(fill_prompt).strip()
+                    middle_description = llm.invoke(fill_prompt).strip()
                     suffix_description = llm.invoke(suffix_prompt).strip()
 
 
                 except Exception as e:
                     print(f"LLM failed for instance {instance_id}: {e}")
-                    #middle_description = "[LLM Description Unavailable]"
+                    middle_description = "[LLM Description Unavailable]"
                     prefix_description = "[LLM Description Unavailable]"
                     suffix_description = "[LLM Description Unavailable]"
                 prefix_description = re.sub(r'<think>.*?</think>', '', prefix_description, flags=re.DOTALL).strip()
-                #middle_description = re.sub(r'<think>.*?</think>', '', middle_description, flags=re.DOTALL).strip()
+                middle_description = re.sub(r'<think>.*?</think>', '', middle_description, flags=re.DOTALL).strip()
                 suffix_description = re.sub(r'<think>.*?</think>', '', suffix_description, flags=re.DOTALL).strip()
                 description_record = {
                     "instance_id": instance_id,
                     "repo": datapoint["repo"],
                     "px_description": prefix_description,
+                    "mid_description": middle_description,
                     "sx_description": suffix_description
                 }
                 with jsonlines.open(descriptions_log_path, 'a') as descriptions_writer:
                     descriptions_writer.write(description_record)
                 px_description_comment = "\n".join(f"# {line}" for line in prefix_description.splitlines())
-                #mid_description_comment = "\n".join(f"# {line}" for line in middle_description.splitlines())
+                mid_description_comment = "\n".join(f"# {line}" for line in middle_description.splitlines())
                 sx_description_comment = "\n".join(f"# {line}" for line in suffix_description.splitlines())
 
                 # STEP 3: Prepend to prefix
-                prefix = f"{px_description_comment}\n\n{original_prefix}"
-                suffix = f"{sx_description_comment}\n\n{original_suffix}"
+                prefix = f"{px_description_comment}\n{original_prefix}"
+                suffix = f"{mid_description_comment}\n\n{sx_description_comment}\n{original_suffix}"
 
                 top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
                 selected_files = [file_path for file_path, _ in top_chunks]
@@ -843,6 +1132,89 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                             file_content=chunk_content
                         )
                         context_parts.append(context_part)
+            elif strategy == "bm25_top_n_chunks_attached_with_file_desc":
+                top_chunks = bm25_top_n_chunks_with_cached_desc(root_directory, datapoint['prefix'], datapoint['suffix'], extension, "desc_cache")
+                selected_files = [file_path for file_path, _, _ in top_chunks]
+                for file_path, chunk_content, file_desc in top_chunks:
+                    clean_file_name = file_path[len(root_directory) + 1:]
+
+                    # Attach the file description as a comment above the chunk
+                    context_part = (
+                        f"{FILE_SEP_SYMBOL}{clean_file_name}\n"
+                        f"# This chunk comes from: {clean_file_name}\n"
+                        f"# File purpose: {file_desc.strip()}\n\n"
+                        f"{chunk_content.strip()}\n"
+                    )
+                    print(context_part)
+                    context_parts.append(context_part)
+                    used_tokens += estimate_tokens(context_part)
+                total_tokens_used = used_tokens
+            elif strategy == "bm25_iterative_rag":
+                # Step 1: Initial retrieval
+                initial_chunks = bm25_top_n_chunks(root_directory, prefix, suffix, extension)
+                initial_context = ""
+                for file_path, chunk in initial_chunks:
+                    clean_file_name = file_path[len(root_directory) + 1:]
+                    FILE_SEP_SYMBOL_MELLUM = "<filename>"
+                    initial_context += FILE_COMPOSE_FORMAT.format(
+                        file_sep=FILE_SEP_SYMBOL_MELLUM,
+                        file_name=clean_file_name,
+                        file_content=chunk
+                    )
+
+                # Step 2: Generate rough middle code (improved prompt formatting)
+                bootstrap_prompt = f"""
+
+                # === [Relevant Code Snippets from Other Files] ===
+                {initial_context}
+
+                # === [Start of Target File] ===
+                <fim_prefix> {prefix} 
+
+                # === [COMPLETION STARTS HERE] ===
+                <fim_middle>
+                
+
+                <fim_suffix> {suffix}
+                # === [End of Target File] ===
+                """
+                try:
+                    bootstrap_middle = llm_code_completion.invoke(bootstrap_prompt).strip()
+                except Exception as e:
+                    print(f"[Bootstrap Generation Failed]: {e}")
+                    bootstrap_middle = ""
+
+                bootstrap_middle = re.sub(r'<think>.*?</think>', '', bootstrap_middle, flags=re.DOTALL).strip()
+                # Step 3: Refined retrieval
+                refined_query = f"{prefix}\n{bootstrap_middle}"
+                refined_chunks = bm25_top_n_chunks(root_directory, refined_query, "", extension)
+                refined_context = ""
+                for file_path, chunk in refined_chunks:
+                    clean_file_name = file_path[len(root_directory) + 1:]
+                    refined_context += FILE_COMPOSE_FORMAT.format(
+                        file_sep=FILE_SEP_SYMBOL,
+                        file_name=clean_file_name,
+                        file_content=chunk
+                    )
+
+                # Add to context
+                context_parts.append(refined_context)
+                used_tokens += estimate_tokens(refined_context)
+                total_tokens_used = used_tokens
+                debug_dir = "iterative_rag_debug_dir"
+                # Optional Debug Dump
+                if debug_dir:
+                    os.makedirs(debug_dir, exist_ok=True)
+                    with open(os.path.join(debug_dir, f"{instance_id}_initial_context.txt"), 'w',
+                              encoding='utf-8') as f:
+                        f.write(initial_context)
+                    with open(os.path.join(debug_dir, f"{instance_id}_bootstrap_middle.txt"), 'w',
+                              encoding='utf-8') as f:
+                        f.write(bootstrap_middle)
+                    with open(os.path.join(debug_dir, f"{instance_id}_refined_context.txt"), 'w',
+                              encoding='utf-8') as f:
+                        f.write(refined_context)
+
             elif strategy == "bm25_chunks_above_percentile":
                 threshold_percentile = 98.5
                 #histogram_output_dir = "bm25_histograms_practice_percentile_1.5"
@@ -873,7 +1245,8 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
 
-            if strategy not in ["bm25_chunks_text_info_hint", "bm25_chunks_limited", "bm25_chunks_above_percentile", "bm25_chunks_target_file_text_info", "bm25_chunks_text_info_px_mid_sx", "bm25_chunks_text_info_mid_hint_no_other_context"]:
+            if strategy not in ["bm25_chunks_text_info_hint", "bm25_chunks_limited", "bm25_chunks_above_percentile", "bm25_chunks_target_file_text_info", "bm25_chunks_text_info_px_mid_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
+                                , "bm25_top_n_chunks_attached_with_file_desc", "bm25_chunks_target_file_and_mis_code_text_info"]:
                 for file_path in selected_files:
                     if not file_path:
                         continue
