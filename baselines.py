@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 import csv
 import matplotlib.pyplot as plt
 import tiktoken
@@ -12,7 +12,8 @@ import numpy as np
 
 from rank_bm25 import BM25Okapi
 from langchain_ollama import OllamaLLM
-from chunking import basic_ast_chunk_code
+from chunking import ast_chunk_code_with_comments, ast_chunk_code_with_context
+from transformers import AutoTokenizer
 
 argparser = argparse.ArgumentParser()
 # Parameters for context collection strategy
@@ -125,112 +126,24 @@ You are given:
 - A PREFIX and a SUFFIX from the same source file.
 - CONTEXT from other relevant files in the same repository.
 
-Your task is to generate the missing middle code between the PREFIX and SUFFIX.
+Your task is to generate the missing middle code between the PREFIX and SUFFIX (Fill in the middle logic).
 Use the CONTEXT to ensure consistency, correctness, and completeness.
 """
 
 
-
-
 llm = OllamaLLM(model="qwen3:8b", temperature=0)
 
-llm_code_completion = OllamaLLM(model="JetBrains/Mellum-4b-sft-python")
+llm_code_completion = OllamaLLM(model="qwen2.5-coder:14b")
 
-# def prepare_bm25_str(s: str) -> list[str]:
-#     return "".join(c if c.isalnum() else " " for c in s.lower()).split()
-
-# ---------- File Description Caching ----------
-
-def load_file_description_cache(path):
-    if os.path.exists(path):
-        with jsonlines.open(path, 'r') as reader:
-            return {r['file_path']: r['description'] for r in reader}
-    return {}
-
-def save_file_description_cache(path, description_cache):
-    with jsonlines.open(path, 'w') as writer:
-        for file_path, description in description_cache.items():
-            writer.write({'file_path': file_path, 'description': description})
-
-# ---------- Multi-threaded File Description Generation ----------
-
-def batch_describe_files(file_paths, llm, max_workers=8):
-    def describe(file_path):
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            prompt = f"""You are a senior software developer.
-
-Below is the full content of a file from a large codebase. 
-Summarize what this file does including its main responsibilities, behaviors, and the kinds of objects/functions it defines.
-
-Be concise but informative. 
-Your response should be between (1-3) sentences.
-Avoid generic phrases.
---- FILE ---
-{content}
---- END FILE ---
-"""
-            response = llm.invoke(prompt).strip()
-            # ✅ Remove anything within <think>...</think> tags
-            cleaned_response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
-            return file_path, cleaned_response
-        except Exception as e:
-            print(f"Failed describing {file_path}: {e}")
-            return file_path, "[No description available]"
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        results = list(tqdm(executor.map(describe, file_paths), total=len(file_paths)))
-    return {file_path: desc for file_path, desc in results}
+mellum_tokenizer = AutoTokenizer.from_pretrained("JetBrains/Mellum-4b-sft-python")
 
 
-# ---------- BM25 Efficient Retrieval ----------
+def prepare_bm25_str(s: str) -> list[str]:
+    return "".join(c if c.isalnum() else " " for c in s.lower()).split()
 
-def bm25_top_n_chunks_with_cached_desc(
-    root_dir, prefix, suffix, ext,  desc_cache_path, top_k=5, max_lines=20
-):
-    description_cache = load_file_description_cache(desc_cache_path)
-
-    file_paths = []
-    for dirpath, _, filenames in os.walk(root_dir):
-        for filename in filenames:
-            if filename.endswith(ext):
-                file_path = os.path.join(dirpath, filename)
-                try:
-                    with open(file_path, 'r') as f:
-                        if sum(1 for _ in f) > max_lines:
-                            file_paths.append(file_path)
-                except: pass
-
-    uncached_files = [f for f in file_paths if f not in description_cache]
-    if uncached_files:
-        desc_updates = batch_describe_files(uncached_files, llm)
-        description_cache.update(desc_updates)
-        save_file_description_cache(desc_cache_path, description_cache)
-
-    all_chunks = []
-    for file_path in file_paths:
-        desc = description_cache[file_path]
-        with open(file_path, 'r') as f:
-            content = f.read()
-        chunks = basic_ast_chunk_code(content, language)
-        all_chunks.extend([(file_path, c, desc) for c in chunks if len(c.splitlines()) > 5])
-
-    if not all_chunks: return []
-
-    bm25 = BM25Okapi([prepare_bm25_str(c) for _, c, _ in all_chunks])
-    query = prepare_bm25_str(prefix + ' ' + suffix)
-    scores = bm25.get_scores(query)
-    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-    # Reverse the order to go from lowest of top 3 to highest
-    reversed_top_indices = top_indices[::-1]
-
-    return [all_chunks[i] for i in reversed_top_indices]
-
-# ---------- Utilities ----------
-
-def prepare_bm25_str(s):
-    return re.sub(r'[^a-zA-Z0-9]', ' ', s.lower()).split()
+def count_tokens(text: str) -> int:
+    # Use tokenizer.encode instead of .tokenize for accuracy
+    return len(mellum_tokenizer.encode(text, add_special_tokens=False))
 
 def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None) -> list[tuple[str, str]]:
     if file_path in chunk_cache:
@@ -240,7 +153,7 @@ def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None
             content = f.read()
     except Exception:
         return []
-    chunks = basic_ast_chunk_code(content, language)
+    chunks = ast_chunk_code_with_comments(content, language)
     chunk_entries = [(file_path, chunk) for chunk in chunks]
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
@@ -251,53 +164,19 @@ def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None
     chunk_cache[file_path] = chunk_entries
     return chunk_entries
 
+def assemble_context(top_chunks, file_descriptions, root_dir):
+    context_parts = []
+    for file_path, chunk_content in top_chunks:
+        clean_file_name = file_path[len(root_dir) + 1:]
+        file_desc = re.sub(r'<think>.*?</think>', '', file_descriptions[file_path], flags=re.DOTALL).strip()
 
-def get_chunks_for_file_with_desc(
-    file_path: str,
-    chunk_cache: dict,
-    description_cache: dict,
-    debug_dir: str = None
-) -> list[tuple[str, str, str]]:
-    """
-    Breaks a file into AST-based chunks and attaches a file-level description to each chunk.
-    Returns list of (file_path, chunk_text, file_description).
-    """
-    if file_path in chunk_cache:
-        return chunk_cache[file_path]
-
-    # Try to read file
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-    except Exception as e:
-        print(f"Error reading {file_path}: {e}")
-        return []
-
-    # Retrieve or generate file-level description
-    if file_path in description_cache:
-        current_file_desc = description_cache[file_path]
-    else:
-        current_file_desc = describe_file(file_path)
-        description_cache[file_path] = current_file_desc
-
-    current_file_desc = re.sub(r'<think>.*?</think>', '', current_file_desc, flags=re.DOTALL).strip()
-    # Chunk the file and attach description
-    chunks = basic_ast_chunk_code(content, language)
-    chunk_entries = [(file_path, chunk, current_file_desc) for chunk in chunks]
-
-    # Optionally write debug view of chunks
-    if debug_dir:
-        os.makedirs(debug_dir, exist_ok=True)
-        debug_file = os.path.join(debug_dir, os.path.basename(file_path) + ".chunks.txt")
-        with open(debug_file, 'w', encoding='utf-8') as f:
-            f.write(f"# 📄 File Description:\n# {current_file_desc.strip()}\n\n")
-            for i, (_, chunk, _) in enumerate(chunk_entries):
-                f.write(f"--- Chunk {i + 1} ---\n{chunk.strip()}\n\n")
-
-    # Cache results
-    chunk_cache[file_path] = chunk_entries
-    return chunk_entries
-
+        context_part = (
+            f"{FILE_SEP_SYMBOL}{clean_file_name}\n"
+            f"# This code snippet comes from this file: {clean_file_name},{file_desc}\n\n "
+            f"{chunk_content.strip()}\n"
+        )
+        context_parts.append(context_part)
+    return context_parts
 
 def find_random_file(root_dir: str, min_lines: int = 10) -> str:
     """
@@ -380,28 +259,62 @@ def describe_file(file_path: str) -> str:
     with open(file_path, 'r', encoding='utf-8') as f:
         content = f.read()
 
-    file_desc_prompt = f"""You are a senior software developer.
+    file_desc_prompt = f"""
+    You are a senior software engineer writing a brief code summary for documentation.
 
-Below is the full content of a file from a large codebase. 
-Summarize what this file does including its main responsibilities, behaviors, and the kinds of objects/functions it defines.
+    TASK:
+    Summarize the content of the file below in EXACTLY 1 to 3 sentences.
 
-Be concise but informative. 
-Your response should be between (1-3) sentences.
-Avoid generic phrases.
+    RULES:
+    - Be direct and factual.
+    - Cover key responsibilities, important functions/classes, and main behaviors.
+    - Avoid generic phrases or commentary.
+    - Any response longer than 3 sentences will be discarded.
 
---- BEGIN FILE ---
-{content}
---- END FILE ---
-"""
+    EXAMPLE:
+    If the file content is:
+    --- BEGIN FILE ---
+    def add(a, b):
+        return a + b
+    --- END FILE ---
+
+    The summary should be:
+    "This file defines a simple addition function that takes two numbers and returns their sum."
+
+    Now, summarize the following file:
+
+    --- BEGIN FILE ---
+    <file_content>
+    {content}
+    <file_content>
+    --- END FILE ---
+
+    Provide ONLY the summary (1-3 sentences), nothing else.
+    """
+
     try:
         return llm.invoke(file_desc_prompt).strip()
     except Exception as e:
         print(f"Failed to describe {file_path}: {e}")
         return "[No description available]"
 
+def describe_files_for_top_chunks(top_chunks, description_cache):
+    unique_files = set(file_path for file_path, _ in top_chunks)
+    file_descriptions = {}
+
+    for file_path in unique_files:
+        if file_path in description_cache:
+            file_descriptions[file_path] = description_cache[file_path]
+        else:
+            desc = describe_file(file_path)
+            description_cache[file_path] = desc
+            file_descriptions[file_path] = desc
+
+    return file_descriptions
 
 
-def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: int = 10, no_of_files: int = 3) -> List[str]:
+
+def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: int = 10, no_of_files: int = 4) -> List[str]:
     """
     Select the top three files:
         - in the given language
@@ -446,9 +359,9 @@ def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: in
     top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:no_of_files]
 
     # Reverse the order to go from lowest of top 3 to highest
-    reversed_top_indices = top_indices[::-1]
+    #reversed_top_indices = top_indices[::-1]
 
-    return [file_names[i] for i in reversed_top_indices]
+    return [file_names[i] for i in top_indices]
 
 
 def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 5) -> list[tuple[str, str]]:
@@ -474,43 +387,34 @@ def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: 
 
     return [all_chunks[i] for i in reversed_top_indices]
 
-def bm25_top_n_chunks_attached_with_file_desc(
-    root_dir: str,
-    prefix: str,
-    suffix: str,
-    ext: str,
-    top_k: int = 3
-) -> list[tuple[str, str, str]]:
-    """
-    Retrieves the top-k BM25-matching chunks, each with its file-level description.
-    Returns a list of (file_path, chunk_content, file_description).
-    """
-    all_chunks = []  # type: list[tuple[str, str, str]]
+def bm25_top_n_chunks_with_tokens(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 5) -> List[Tuple[str, str, int]]:
+    all_chunks = []
     chunk_cache = {}
-    description_cache = {}
 
     for dirpath, _, filenames in os.walk(root_dir):
         for filename in filenames:
             if filename.endswith(ext):
                 file_path = os.path.join(dirpath, filename)
-                chunks_with_desc = get_chunks_for_file_with_desc(file_path, chunk_cache, description_cache)
-                all_chunks.extend(chunks_with_desc)
+                chunks = get_chunks_for_file(file_path, chunk_cache)
+                all_chunks.extend(chunks)
 
-    if not all_chunks:
-        return []
-
-    # Compute BM25 scores over the chunks only (ignore file descriptions for ranking)
-    chunk_texts = [prepare_bm25_str(chunk) for _, chunk, _ in all_chunks]
+    chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
     query = prepare_bm25_str(prefix + " " + suffix)
+
+    if not chunk_texts:
+        return []
 
     bm25 = BM25Okapi(chunk_texts)
     scores = bm25.get_scores(query)
-
-    # Get top-k indices and reverse (if desired)
     top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-    reversed_top_indices = top_indices[::-1]
 
-    return [all_chunks[i] for i in reversed_top_indices]
+    result = []
+    for idx in top_indices:
+        file_path, chunk = all_chunks[idx]
+        token_count = count_tokens(chunk)
+        result.append((file_path, chunk, token_count))
+
+    return result
 
 
 def bm25_top_n_chunks_with_missing_code_description(
@@ -542,12 +446,30 @@ def bm25_top_n_chunks_with_missing_code_description(
     return [all_chunks[i] for i in reversed_top_indices]
 
 
+def save_chunks_and_tokens(datapoint_id: str, root_directory: str, debug_dir: str, chunks_result: List[Tuple[str, str, int]]):
+
+    os.makedirs(debug_dir, exist_ok=True)
+    chunk_file_path = os.path.join(debug_dir, f"{datapoint_id}_chunks.txt")
+    token_file_path = os.path.join(debug_dir, f"{datapoint_id}_token_stats.txt")
+
+    total_tokens = 0
+
+    with open(chunk_file_path, "w", encoding="utf-8") as chunk_file, open(token_file_path, "w", encoding="utf-8") as token_file:
+        for idx, (file_path, chunk, token_count) in enumerate(chunks_result):
+            clean_file_name = file_path[len(root_directory) + 1:]
+            chunk_file.write(f"--- Chunk {idx + 1}: {clean_file_name} ---\n{chunk.strip()}\n\n")
+            token_file.write(f"Chunk {idx + 1}: {clean_file_name} - {token_count} tokens\n")
+            total_tokens += token_count
+
+        token_file.write(f"\nTotal tokens (top {len(chunks_result)} chunks): {total_tokens}\n")
+
+
 def bm25_chunks_within_limit_sorted_low_to_high(
     root_dir: str,
     prefix: str,
     suffix: str,
     ext: str,
-    context_limit: int = 8000
+    context_limit: int = 6000
 ) -> tuple[list[tuple[str, str]], int]:
     all_chunks = []
     chunk_cache = {}
@@ -560,21 +482,18 @@ def bm25_chunks_within_limit_sorted_low_to_high(
     if not all_chunks:
         return [], 0
 
-    enc = tiktoken.encoding_for_model("gpt-4")
     query = prepare_bm25_str(prefix + " " + suffix)
     chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
 
     bm25 = BM25Okapi(chunk_texts)
     scores = bm25.get_scores(query)
-
     ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
 
     selected_chunks = []
     context_parts = []
 
-    # Token budget: count prefix + suffix first
-    prefix_tokens = len(enc.encode(prefix))
-    suffix_tokens = len(enc.encode(suffix))
+    prefix_tokens = count_tokens(prefix)
+    suffix_tokens = count_tokens(suffix)
     total_tokens = prefix_tokens + suffix_tokens
 
     for i in ranked_indices:
@@ -586,17 +505,18 @@ def bm25_chunks_within_limit_sorted_low_to_high(
             file_content=chunk_content
         )
 
-        chunk_tokens = len(enc.encode(context_part))
+        chunk_tokens = count_tokens(context_part)
         if total_tokens + chunk_tokens > context_limit:
             break
         selected_chunks.append((file_path, chunk_content))
         context_parts.append(context_part)
         total_tokens += chunk_tokens
-        # Sort selected chunks from low to high BM25
-        selected_chunks = sorted(
-            selected_chunks,
-            key=lambda x: scores[all_chunks.index(x)]
-        )
+
+    # Sort final selected chunks from low to high BM25 (i.e., weak to strong match)
+    selected_chunks = sorted(
+        selected_chunks,
+        key=lambda x: scores[all_chunks.index(x)]
+    )
     return selected_chunks, total_tokens
 
 def bm25_chunks_above_percentile(
@@ -665,7 +585,6 @@ def bm25_chunks_above_percentile(
 
     return sorted(included_chunks, key=lambda x: scores[all_chunks.index(x)], reverse=True)
 
-
 def find_random_recent_file(root_dir: str, recent_filenames: list[str], min_lines: int = 10) -> str:
     """
     Select the most recent file:
@@ -705,9 +624,6 @@ def trim_suffix(suffix: str):
         suffix = "\n".join(suffix_lines[:10])
     return suffix
 
-def estimate_tokens(text: str, model: str = "gpt-4")->int:
-    enc = tiktoken.encoding_for_model(model)
-    return len(enc.encode(text))
 
 def log_token_usage(token_log_path: str, instance_id: int, files: List[str], token_count: int, prefix_suffix_tokens: int):
     file_list = ", ".join(files)
@@ -723,7 +639,6 @@ def log_token_usage(token_log_path: str, instance_id: int, files: List[str], tok
             'PrefixSuffixTokens': prefix_suffix_tokens,
             'TotalTokens': token_count
         })
-
 
 def plot_token_usage_chart(token_log_path: str):
     instances = []
@@ -777,6 +692,7 @@ descriptions_log_path = os.path.join("predictions", f"{language}-{stage}-{strate
 with jsonlines.open(completion_points_file, 'r') as reader:
     with jsonlines.open(predictions_file, 'w') as writer:
         for instance_id, datapoint in enumerate(reader):
+            repo_id = datapoint['id']
             repo_path = datapoint['repo'].replace("/", "__")
             repo_revision = datapoint['revision']
             root_directory = os.path.join("data", f"repositories-{language}-{stage}", f"{repo_path}-{repo_revision}")
@@ -792,17 +708,19 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 selected_files = [find_random_file(root_directory)]
             elif strategy == "bm25":
                 selected_files = [find_bm25_file(root_directory, datapoint['prefix'], datapoint['suffix'])]
-            elif strategy == "bm25_top_3_files":
+            elif strategy == "bm25_top_4_files":
                 selected_files = find_bm25_top_3_files(root_directory, datapoint['prefix'], datapoint['suffix'])
-            elif strategy == "bm25_chunks":
-                top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
-                selected_files = [file_path for file_path, _ in top_chunks]
-                for file_path, chunk_content in top_chunks:
+            elif strategy == "bm25_top_5_chunks_with_metadata_limited_chunktokens_512":
+                top_chunks = bm25_top_n_chunks_with_tokens(root_directory, datapoint['prefix'], datapoint['suffix'],
+                                                           extension)
+                save_chunks_and_tokens(repo_id, root_directory, "debug_dir_1", top_chunks)
+                selected_files = [file_path for file_path, _, _ in top_chunks]
+                for file_path, chunk_content, _ in top_chunks:
                     clean_file_name = file_path[len(root_directory) + 1:]
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
                                                               file_content=chunk_content)
                     context_parts.append(context_part)
-                    used_tokens += estimate_tokens(context_part)
+                    used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
             elif strategy == "bm25_chunks_text_info_mid_hint_no_other_context":
                 # STEP 1: Get original prefix/suffix
@@ -851,7 +769,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     clean_file_name = file_path[len(root_directory) + 1:]
                     context_part = ""
                     context_parts.append(context_part)
-                    used_tokens += estimate_tokens(context_part)
+                    used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
             elif strategy == "bm25_chunks_mid_desc_bm25_query":
                 # STEP 1: Get original prefix/suffix
@@ -888,7 +806,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
                                                               file_content=chunk_content)
                     context_parts.append(context_part)
-                    used_tokens += estimate_tokens(context_part)
+                    used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
             elif strategy == "bm25_chunks_target_file_text_info":
                 # STEP 1: Get original prefix/suffix
@@ -933,7 +851,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
                                                            file_content=chunk_content)
                     context_parts.append(context_part)
-                    used_tokens += estimate_tokens(context_part)
+                    used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
             elif strategy == "bm25_chunks_text_info_hint":
                 # STEP 1: Get original prefix/suffix
@@ -983,7 +901,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
                                                               file_content=chunk_content)
                     context_parts.append(context_part)
-                    used_tokens += estimate_tokens(context_part)
+                    used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
             elif strategy == "bm25_chunks_target_file_and_mis_code_text_info":
                 # STEP 1: Get original prefix/suffix
@@ -1043,7 +961,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
                                                            file_content=chunk_content)
                     context_parts.append(context_part)
-                    used_tokens += estimate_tokens(context_part)
+                    used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
             elif strategy == "bm25_chunks_text_info_px_mid_sx":
                 # STEP 1: Get original prefix/suffix
@@ -1117,38 +1035,51 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
                                                               file_content=chunk_content)
                     context_parts.append(context_part)
-                    used_tokens += estimate_tokens(context_part)
+                    used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
-            elif strategy == "bm25_chunks_limited":
+            elif strategy == "bm25_chunks_limited_6k":
+                    description_cache = {}
                     top_chunks, total_tokens_used = bm25_chunks_within_limit_sorted_low_to_high(
                         root_directory, datapoint['prefix'], datapoint['suffix'], extension
                     )
-                    selected_files = [file_path for file_path, _ in top_chunks]
-                    for file_path, chunk_content in top_chunks:
-                        clean_file_name = file_path[len(root_directory) + 1:]
-                        context_part = FILE_COMPOSE_FORMAT.format(
-                            file_sep=FILE_SEP_SYMBOL,
-                            file_name=clean_file_name,
-                            file_content=chunk_content
-                        )
-                        context_parts.append(context_part)
-            elif strategy == "bm25_top_n_chunks_attached_with_file_desc":
-                top_chunks = bm25_top_n_chunks_with_cached_desc(root_directory, datapoint['prefix'], datapoint['suffix'], extension, "desc_cache")
-                selected_files = [file_path for file_path, _, _ in top_chunks]
-                for file_path, chunk_content, file_desc in top_chunks:
-                    clean_file_name = file_path[len(root_directory) + 1:]
+                    # Only generate descriptions for files relevant to top_chunks
+                    file_descriptions = describe_files_for_top_chunks(top_chunks, description_cache)
 
-                    # Attach the file description as a comment above the chunk
-                    context_part = (
-                        f"{FILE_SEP_SYMBOL}{clean_file_name}\n"
-                        f"# This chunk comes from: {clean_file_name}\n"
-                        f"# File purpose: {file_desc.strip()}\n\n"
-                        f"{chunk_content.strip()}\n"
-                    )
-                    print(context_part)
-                    context_parts.append(context_part)
-                    used_tokens += estimate_tokens(context_part)
+                    # Assemble the context with file-level descriptions
+                    context_parts = assemble_context(top_chunks, file_descriptions, root_directory)
+                    used_tokens = 0
+                    for part in context_parts:
+                        print(part)
+                        used_tokens += count_tokens(part)
+
+                    total_tokens_used = used_tokens
+                    # selected_files = [file_path for file_path, _ in top_chunks]
+                    # for file_path, chunk_content in top_chunks:
+                    #     clean_file_name = file_path[len(root_directory) + 1:]
+                    #     context_part = FILE_COMPOSE_FORMAT.format(
+                    #         file_sep=FILE_SEP_SYMBOL,
+                    #         file_name=clean_file_name,
+                    #         file_content=chunk_content
+                    #     )
+                    #     context_parts.append(context_part)
+            elif strategy == "bm25_top_5_chunks_attached_with_file_desc_refined_prompt":
+                description_cache = {}
+                top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'],
+                                               extension)
+
+                # Only generate descriptions for files relevant to top_chunks
+                file_descriptions = describe_files_for_top_chunks(top_chunks, description_cache)
+
+                # Assemble the context with file-level descriptions
+                context_parts = assemble_context(top_chunks, file_descriptions, root_directory)
+
+                used_tokens = 0
+                for part in context_parts:
+                    print(part)
+                    used_tokens += count_tokens(part)
+
                 total_tokens_used = used_tokens
+
             elif strategy == "bm25_iterative_rag":
                 # Step 1: Initial retrieval
                 initial_chunks = bm25_top_n_chunks(root_directory, prefix, suffix, extension)
@@ -1157,27 +1088,54 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     clean_file_name = file_path[len(root_directory) + 1:]
                     FILE_SEP_SYMBOL_MELLUM = "<filename>"
                     initial_context += FILE_COMPOSE_FORMAT.format(
-                        file_sep=FILE_SEP_SYMBOL_MELLUM,
+                        file_sep=FILE_SEP_SYMBOL,
                         file_name=clean_file_name,
                         file_content=chunk
                     )
 
                 # Step 2: Generate rough middle code (improved prompt formatting)
-                bootstrap_prompt = f"""
+                bootstrap_prompt = f"""{SYSTEM_INSTRUCTION_CODE_GEN}
+
+                # === [EXAMPLE COMPLETION] ===
+                Example PREFIX:
+                <|fim_prefix|>
+                def add_numbers(a, b):
+
+                Example SUFFIX:
+                <|fim_suffix|>
+                    return result
+
+                Example CONTEXT:
+                - Utility function "validate_numbers" is available.
+                - Logging should be used for debugging.
+
+                Example COMPLETION:
+                <|fim_middle|>
+                    validate_numbers(a, b)
+                    result = a + b
+                    logging.debug(f"Adding {{a}} and {{b}}, result = {{result}}")
+
+                # === [END EXAMPLE] ===
+
 
                 # === [Relevant Code Snippets from Other Files] ===
                 {initial_context}
 
                 # === [Start of Target File] ===
-                <fim_prefix> {prefix} 
+                <|fim_prefix|>
+                {prefix} 
 
-                # === [COMPLETION STARTS HERE] ===
-                <fim_middle>
-                
 
-                <fim_suffix> {suffix}
+                # === [CODE COMPLETION STARTS HERE] ===  
+                <|fim_middle|>
+
+
+                <|fim_suffix|>
+                {suffix}
+
                 # === [End of Target File] ===
                 """
+
                 try:
                     bootstrap_middle = llm_code_completion.invoke(bootstrap_prompt).strip()
                 except Exception as e:
@@ -1199,7 +1157,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
                 # Add to context
                 context_parts.append(refined_context)
-                used_tokens += estimate_tokens(refined_context)
+                used_tokens += count_tokens(refined_context)
                 total_tokens_used = used_tokens
                 debug_dir = "iterative_rag_debug_dir"
                 # Optional Debug Dump
@@ -1235,7 +1193,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                         file_content=chunk_content
                     )
                     context_parts.append(context_part)
-                    used_tokens += estimate_tokens(context_part)
+                    used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
 
             elif strategy == "recent":
@@ -1245,8 +1203,9 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
 
-            if strategy not in ["bm25_chunks_text_info_hint", "bm25_chunks_limited", "bm25_chunks_above_percentile", "bm25_chunks_target_file_text_info", "bm25_chunks_text_info_px_mid_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
-                                , "bm25_top_n_chunks_attached_with_file_desc", "bm25_chunks_target_file_and_mis_code_text_info"]:
+            if strategy not in ["bm25_top_5_chunks_with_metadata_limited_chunktokens_512", "bm25_chunks_text_info_hint", "bm25_chunks_limited_6k", "bm25_chunks_above_percentile", "bm25_chunks_target_file_text_info", "bm25_chunks_text_info_px_mid_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
+                                , "bm25_top_5_chunks_attached_with_file_desc_refined_prompt", "bm25_chunks_target_file_and_mis_code_text_info"
+                    ]:
                 for file_path in selected_files:
                     if not file_path:
                         continue
@@ -1260,20 +1219,17 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                             file_content=file_content
                         )
                         context_parts.append(context_part)
-                        used_tokens += estimate_tokens(context_part)
+                        used_tokens += count_tokens(context_part)
                     except Exception as e:
                         print(f"Skipping file {file_path} due to error: {e}")
                         continue
 
             context = "".join(context_parts)
-
-
             submission = {
                 "context": context,
                 "prefix": prefix,
                 "suffix": suffix
             }
-
 
             # Add prefix/suffix if needed
             if args.trim_prefix:
@@ -1285,7 +1241,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             # print(f"Total tokens: {used_tokens}")
             writer.write(submission)
 
-            prefix_suffix_tokens = estimate_tokens(prefix) + estimate_tokens(suffix)
+            prefix_suffix_tokens = count_tokens(prefix) + count_tokens(suffix)
 
             log_token_usage(
                 token_log_path=token_log_path,
