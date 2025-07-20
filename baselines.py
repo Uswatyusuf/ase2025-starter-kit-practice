@@ -8,12 +8,13 @@ import argparse
 import os, jsonlines, concurrent.futures, re
 from tqdm import tqdm
 import numpy as np
+import torch
 
 
 from rank_bm25 import BM25Okapi
 from langchain_ollama import OllamaLLM
 from chunking import ast_chunk_code_with_comments, ast_chunk_code_with_context
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModel
 
 argparser = argparse.ArgumentParser()
 # Parameters for context collection strategy
@@ -137,6 +138,13 @@ llm_code_completion = OllamaLLM(model="qwen2.5-coder:14b")
 
 mellum_tokenizer = AutoTokenizer.from_pretrained("JetBrains/Mellum-4b-sft-python")
 
+
+# Load UniXcoder model and tokenizer once
+tokenizer = AutoTokenizer.from_pretrained("microsoft/unixcoder-base")
+model = AutoModel.from_pretrained("microsoft/unixcoder-base")
+model.eval()  # disable dropout
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
 
 def prepare_bm25_str(s: str) -> list[str]:
     return "".join(c if c.isalnum() else " " for c in s.lower()).split()
@@ -312,6 +320,13 @@ def describe_files_for_top_chunks(top_chunks, description_cache):
 
     return file_descriptions
 
+def get_embedding(text: str) -> np.ndarray:
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512).to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    # Mean pooling of token embeddings
+    embedding = outputs.last_hidden_state.mean(dim=1).squeeze()
+    return embedding.cpu().numpy()
 
 
 def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: int = 10, no_of_files: int = 4) -> List[str]:
@@ -364,7 +379,7 @@ def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: in
     return [file_names[i] for i in top_indices]
 
 
-def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 5) -> list[tuple[str, str]]:
+def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 7) -> list[tuple[str, str]]:
     all_chunks = []
     chunk_cache = {}
     for dirpath, _, filenames in os.walk(root_dir):
@@ -407,6 +422,53 @@ def bm25_top_n_chunks_with_tokens(root_dir: str, prefix: str, suffix: str, ext: 
     bm25 = BM25Okapi(chunk_texts)
     scores = bm25.get_scores(query)
     top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+    reversed_top_indices = top_indices[::-1]
+    result = []
+    for idx in reversed_top_indices:
+        file_path, chunk = all_chunks[idx]
+        token_count = count_tokens(chunk)
+        result.append((file_path, chunk, token_count))
+
+    return result
+
+def embedding_top_n_chunks_with_tokens_unixcoder(
+    root_dir: str,
+    prefix: str,
+    suffix: str,
+    ext: str,
+    top_k: int = 5
+) -> List[Tuple[str, str, int]]:
+    all_chunks = []
+    chunk_cache = {}
+
+    # Step 1: Gather chunks
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.endswith(ext):
+                file_path = os.path.join(dirpath, filename)
+                chunks = get_chunks_for_file(file_path, chunk_cache)  # you already have this
+                for file_path, chunk in chunks:
+                    all_chunks.append((file_path, chunk))
+
+    if not all_chunks:
+        return []
+
+    chunk_texts = [chunk for _, chunk in all_chunks]
+
+    # Step 2: Embed all chunks
+    chunk_embeddings = np.vstack([get_embedding(chunk) for chunk in chunk_texts])
+    chunk_embeddings /= np.linalg.norm(chunk_embeddings, axis=1, keepdims=True)  # Normalize
+
+    # Step 3: Embed query
+    query_text = prefix + " " + suffix
+    query_embedding = get_embedding(query_text)
+    query_embedding /= np.linalg.norm(query_embedding)  # Normalize
+
+    # Step 4: Cosine similarity = dot product since normalized
+    similarities = np.dot(chunk_embeddings, query_embedding)
+
+    # Step 5: Get top-k indices
+    top_indices = np.argsort(similarities)[:top_k]
 
     result = []
     for idx in top_indices:
@@ -415,7 +477,6 @@ def bm25_top_n_chunks_with_tokens(root_dir: str, prefix: str, suffix: str, ext: 
         result.append((file_path, chunk, token_count))
 
     return result
-
 
 def bm25_top_n_chunks_with_missing_code_description(
     root_dir: str,
@@ -624,7 +685,6 @@ def trim_suffix(suffix: str):
         suffix = "\n".join(suffix_lines[:10])
     return suffix
 
-
 def log_token_usage(token_log_path: str, instance_id: int, files: List[str], token_count: int, prefix_suffix_tokens: int):
     file_list = ", ".join(files)
     file_exists = os.path.isfile(token_log_path)
@@ -710,10 +770,10 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 selected_files = [find_bm25_file(root_directory, datapoint['prefix'], datapoint['suffix'])]
             elif strategy == "bm25_top_4_files":
                 selected_files = find_bm25_top_3_files(root_directory, datapoint['prefix'], datapoint['suffix'])
-            elif strategy == "bm25_top_5_chunks_with_metadata_limited_chunktokens_512":
-                top_chunks = bm25_top_n_chunks_with_tokens(root_directory, datapoint['prefix'], datapoint['suffix'],
+            elif strategy == "unixcoder_embedding_top_5_chunks_with_metadata_limited_chunktokens_512_reversed_order":
+                top_chunks = embedding_top_n_chunks_with_tokens_unixcoder(root_directory, datapoint['prefix'], datapoint['suffix'],
                                                            extension)
-                save_chunks_and_tokens(repo_id, root_directory, "debug_dir_1", top_chunks)
+                save_chunks_and_tokens(repo_id, root_directory, "debug_dir_5_em", top_chunks)
                 selected_files = [file_path for file_path, _, _ in top_chunks]
                 for file_path, chunk_content, _ in top_chunks:
                     clean_file_name = file_path[len(root_directory) + 1:]
@@ -1203,7 +1263,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
 
-            if strategy not in ["bm25_top_5_chunks_with_metadata_limited_chunktokens_512", "bm25_chunks_text_info_hint", "bm25_chunks_limited_6k", "bm25_chunks_above_percentile", "bm25_chunks_target_file_text_info", "bm25_chunks_text_info_px_mid_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
+            if strategy not in ["unixcoder_embedding_top_5_chunks_with_metadata_limited_chunktokens_512_reversed_order", "bm25_chunks_text_info_hint", "bm25_chunks_limited_6k", "bm25_chunks_above_percentile", "bm25_chunks_target_file_text_info", "bm25_chunks_text_info_px_mid_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
                                 , "bm25_top_5_chunks_attached_with_file_desc_refined_prompt", "bm25_chunks_target_file_and_mis_code_text_info"
                     ]:
                 for file_path in selected_files:
