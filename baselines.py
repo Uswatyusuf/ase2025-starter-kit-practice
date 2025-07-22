@@ -9,12 +9,17 @@ import os, jsonlines, concurrent.futures, re
 from tqdm import tqdm
 import numpy as np
 import torch
-
+import tree_sitter_python as tspython
+import tree_sitter_kotlin as ts_kotlin
+from tree_sitter import Language, Parser
 
 from rank_bm25 import BM25Okapi
 from langchain_ollama import OllamaLLM
-from chunking import ast_chunk_code_with_comments, ast_chunk_code_with_context
+from chunking import ast_chunk_code_with_comments, basic_ast_chunk_code, basic_ast_chunk_code_methods_only
 from transformers import AutoTokenizer, AutoModel
+
+PY_LANGUAGE = Language(tspython.language())
+KT_LANGUAGE = Language (ts_kotlin.language())
 
 argparser = argparse.ArgumentParser()
 # Parameters for context collection strategy
@@ -58,10 +63,9 @@ Focus on **specific actions** the code performs, such as initializing connection
 
 Avoid using quotes, colons, or meta-language like 'Hint:'.
 
-Keep your description clear and concise (ideally 1-2 sentences).
-
 Start your sentence with "The part requiring completion" followed by its **likely actions and objectives**.
 
+Keep your description clear and concise (1-2 sentences).
 """
 
 SYSTEM_INSTRUCTION_W_TARGET_FILE = """You are an experienced software engineer.
@@ -153,6 +157,9 @@ def count_tokens(text: str) -> int:
     # Use tokenizer.encode instead of .tokenize for accuracy
     return len(mellum_tokenizer.encode(text, add_special_tokens=False))
 
+def count_tokens_unix(text: str) -> int:
+    return len(tokenizer.encode(text, add_special_tokens=False))
+
 def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None) -> list[tuple[str, str]]:
     if file_path in chunk_cache:
         return chunk_cache[file_path]
@@ -161,7 +168,7 @@ def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None
             content = f.read()
     except Exception:
         return []
-    chunks = ast_chunk_code_with_comments(content, language)
+    chunks = basic_ast_chunk_code_methods_only(content, language)
     chunk_entries = [(file_path, chunk) for chunk in chunks]
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
@@ -185,6 +192,54 @@ def assemble_context(top_chunks, file_descriptions, root_dir):
         )
         context_parts.append(context_part)
     return context_parts
+
+def trim_rest_code_with_tokenizer(rest_of_code: str, import_tokens: int, max_tokens: int) -> str:
+    rest_lines = rest_of_code.splitlines()
+    trimmed_lines = []
+    total_tokens = import_tokens
+
+    for line in reversed(rest_lines):
+        line_token_count = count_tokens_unix(line)
+        if total_tokens + line_token_count > max_tokens:
+            break
+        trimmed_lines.insert(0, line)
+        total_tokens += line_token_count
+
+    return '\n'.join(trimmed_lines)
+
+def extract_imports_and_trim_prefix(prefix: str, lang: str, max_tokens: int = 512) -> str:
+    if lang not in ('python', 'kotlin'):
+        raise ValueError(f"Unsupported language: {lang}")
+
+
+    parser= Parser(PY_LANGUAGE if lang == 'python' else KT_LANGUAGE)
+    tree = parser.parse(bytes(prefix, "utf8"))
+    root_node = tree.root_node
+    code_lines = prefix.splitlines()
+
+    # Extract import lines
+    import_lines = []
+    for node in root_node.children:
+        if lang == 'python' and node.type in ('import_statement', 'import_from_statement'):
+            start, end = node.start_point[0], node.end_point[0]
+            import_lines.extend(code_lines[start:end + 1])
+        elif lang == 'kotlin' and node.type == 'import_directive':
+            start, end = node.start_point[0], node.end_point[0]
+            import_lines.extend(code_lines[start:end + 1])
+
+    import_section = '\n'.join(import_lines)
+    rest_of_code = '\n'.join([line for line in code_lines if line not in import_lines])
+
+    import_tokens = count_tokens_unix(import_section)
+    rest_tokens = count_tokens_unix(rest_of_code)
+
+    if import_tokens + rest_tokens <= max_tokens:
+        return prefix
+
+    trimmed_rest_code = trim_rest_code_with_tokenizer(rest_of_code, import_tokens, max_tokens)
+    final_prefix = (import_section + '\n' + trimmed_rest_code).strip()
+    return final_prefix
+
 
 def find_random_file(root_dir: str, min_lines: int = 10) -> str:
     """
@@ -379,14 +434,14 @@ def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: in
     return [file_names[i] for i in top_indices]
 
 
-def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 7) -> list[tuple[str, str]]:
+def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 5) -> list[tuple[str, str]]:
     all_chunks = []
     chunk_cache = {}
     for dirpath, _, filenames in os.walk(root_dir):
         for filename in filenames:
             if filename.endswith(ext):
                 file_path = os.path.join(dirpath, filename)
-                all_chunks.extend(get_chunks_for_file(file_path, chunk_cache))
+                all_chunks.extend(get_chunks_for_file(file_path, chunk_cache, "debug-dir-methods-only"))
 
     chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
     query = prepare_bm25_str(prefix + " " + suffix)
@@ -436,17 +491,20 @@ def embedding_top_n_chunks_with_tokens_unixcoder(
     prefix: str,
     suffix: str,
     ext: str,
-    top_k: int = 5
+    lang: str,
+    top_k: int = 3
 ) -> List[Tuple[str, str, int]]:
     all_chunks = []
     chunk_cache = {}
+
+    prefix = extract_imports_and_trim_prefix(prefix, lang)
 
     # Step 1: Gather chunks
     for dirpath, _, filenames in os.walk(root_dir):
         for filename in filenames:
             if filename.endswith(ext):
                 file_path = os.path.join(dirpath, filename)
-                chunks = get_chunks_for_file(file_path, chunk_cache)  # you already have this
+                chunks = get_chunks_for_file(file_path, chunk_cache)
                 for file_path, chunk in chunks:
                     all_chunks.append((file_path, chunk))
 
@@ -457,18 +515,18 @@ def embedding_top_n_chunks_with_tokens_unixcoder(
 
     # Step 2: Embed all chunks
     chunk_embeddings = np.vstack([get_embedding(chunk) for chunk in chunk_texts])
-    chunk_embeddings /= np.linalg.norm(chunk_embeddings, axis=1, keepdims=True)  # Normalize
+    chunk_embeddings /= np.linalg.norm(chunk_embeddings, axis=1, keepdims=True)
 
     # Step 3: Embed query
     query_text = prefix + " " + suffix
     query_embedding = get_embedding(query_text)
-    query_embedding /= np.linalg.norm(query_embedding)  # Normalize
+    query_embedding /= np.linalg.norm(query_embedding)
 
-    # Step 4: Cosine similarity = dot product since normalized
+    # Step 4: Cosine similarity
     similarities = np.dot(chunk_embeddings, query_embedding)
 
-    # Step 5: Get top-k indices
-    top_indices = np.argsort(similarities)[:top_k]
+    # Step 5: Top-k indices
+    top_indices = np.argsort(similarities)[-top_k:][::-1]
 
     result = []
     for idx in top_indices:
@@ -530,7 +588,7 @@ def bm25_chunks_within_limit_sorted_low_to_high(
     prefix: str,
     suffix: str,
     ext: str,
-    context_limit: int = 6000
+    context_limit: int = 8000
 ) -> tuple[list[tuple[str, str]], int]:
     all_chunks = []
     chunk_cache = {}
@@ -770,10 +828,29 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 selected_files = [find_bm25_file(root_directory, datapoint['prefix'], datapoint['suffix'])]
             elif strategy == "bm25_top_4_files":
                 selected_files = find_bm25_top_3_files(root_directory, datapoint['prefix'], datapoint['suffix'])
-            elif strategy == "unixcoder_embedding_top_5_chunks_with_metadata_limited_chunktokens_512_reversed_order":
+            elif strategy == "bm25_top_5_chunks_methods_only":
+                top_chunks= bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
+                selected_files = [file_path for file_path, _ in top_chunks]
+                for file_path, chunk_content in top_chunks:
+                    clean_file_name = file_path[len(root_directory) + 1:]
+                    context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
+                                                              file_content=chunk_content)
+                    context_parts.append(context_part)
+                    used_tokens += count_tokens(context_part)
+                total_tokens_used = used_tokens
+                output_file = f"top_chunks_{repo_id}.txt"
+                with open(output_file, "w", encoding="utf-8") as f:
+                        f.write(f"# Root Directory: {root_directory}\n\n")
+                        for file_path, chunk_content in top_chunks:
+                            clean_file_name = file_path[len(root_directory) + 1:]
+                            header = f"## File: {clean_file_name}\n"
+                            f.write(header)
+                            f.write(chunk_content)
+                            f.write("\n\n")  # Separate chunks clearly
+            elif strategy == "unix_emb_top_3_basic_chunks_512_tokens_with_metadata_reversed_order":
                 top_chunks = embedding_top_n_chunks_with_tokens_unixcoder(root_directory, datapoint['prefix'], datapoint['suffix'],
-                                                           extension)
-                save_chunks_and_tokens(repo_id, root_directory, "debug_dir_5_em", top_chunks)
+                                                           extension, language)
+                save_chunks_and_tokens(repo_id, root_directory, "debug_dir_3_em_unix", top_chunks)
                 selected_files = [file_path for file_path, _, _ in top_chunks]
                 for file_path, chunk_content, _ in top_chunks:
                     clean_file_name = file_path[len(root_directory) + 1:]
@@ -868,7 +945,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_parts.append(context_part)
                     used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
-            elif strategy == "bm25_chunks_target_file_text_info":
+            elif strategy == "bm25_top_5_chunks_target_file_text_info":
                 # STEP 1: Get original prefix/suffix
                 original_prefix = datapoint["prefix"]
                 original_suffix = datapoint["suffix"]
@@ -1023,7 +1100,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_parts.append(context_part)
                     used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
-            elif strategy == "bm25_chunks_text_info_px_mid_sx":
+            elif strategy == "bm25_chunks_text_info_px_sx":
                 # STEP 1: Get original prefix/suffix
                 original_prefix = datapoint["prefix"]
                 original_suffix = datapoint["suffix"]
@@ -1059,7 +1136,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
                 try:
                     prefix_description = llm.invoke(prefix_prompt).strip()
-                    middle_description = llm.invoke(fill_prompt).strip()
+                    #middle_description = llm.invoke(fill_prompt).strip()
                     suffix_description = llm.invoke(suffix_prompt).strip()
 
 
@@ -1069,24 +1146,23 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     prefix_description = "[LLM Description Unavailable]"
                     suffix_description = "[LLM Description Unavailable]"
                 prefix_description = re.sub(r'<think>.*?</think>', '', prefix_description, flags=re.DOTALL).strip()
-                middle_description = re.sub(r'<think>.*?</think>', '', middle_description, flags=re.DOTALL).strip()
+                #middle_description = re.sub(r'<think>.*?</think>', '', middle_description, flags=re.DOTALL).strip()
                 suffix_description = re.sub(r'<think>.*?</think>', '', suffix_description, flags=re.DOTALL).strip()
                 description_record = {
                     "instance_id": instance_id,
                     "repo": datapoint["repo"],
                     "px_description": prefix_description,
-                    "mid_description": middle_description,
                     "sx_description": suffix_description
                 }
                 with jsonlines.open(descriptions_log_path, 'a') as descriptions_writer:
                     descriptions_writer.write(description_record)
                 px_description_comment = "\n".join(f"# {line}" for line in prefix_description.splitlines())
-                mid_description_comment = "\n".join(f"# {line}" for line in middle_description.splitlines())
+                #mid_description_comment = "\n".join(f"# {line}" for line in middle_description.splitlines())
                 sx_description_comment = "\n".join(f"# {line}" for line in suffix_description.splitlines())
 
                 # STEP 3: Prepend to prefix
                 prefix = f"{px_description_comment}\n{original_prefix}"
-                suffix = f"{mid_description_comment}\n\n{sx_description_comment}\n{original_suffix}"
+                suffix = f"{sx_description_comment}\n{original_suffix}"
 
                 top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
                 selected_files = [file_path for file_path, _ in top_chunks]
@@ -1140,7 +1216,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
                 total_tokens_used = used_tokens
 
-            elif strategy == "bm25_iterative_rag":
+            elif strategy == "bm25_iterative_rag_3_chunks":
                 # Step 1: Initial retrieval
                 initial_chunks = bm25_top_n_chunks(root_directory, prefix, suffix, extension)
                 initial_context = ""
@@ -1157,23 +1233,36 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 bootstrap_prompt = f"""{SYSTEM_INSTRUCTION_CODE_GEN}
 
                 # === [EXAMPLE COMPLETION] ===
-                Example PREFIX:
+                # Example PREFIX:
                 <|fim_prefix|>
-                def add_numbers(a, b):
+                def filter_even_numbers(numbers):
 
-                Example SUFFIX:
+                # Example SUFFIX:
                 <|fim_suffix|>
-                    return result
+                    return filtered
 
                 Example CONTEXT:
-                - Utility function "validate_numbers" is available.
-                - Logging should be used for debugging.
+                <|file_sep|>
+                # utils/number_utils.py
+                def is_even(number):
+                    return number % 2 == 0
+                
+                <|file_sep|>
+                # utils/logger_config.py
+                import logging
+                
+                logging.basicConfig(level=logging.DEBUG)
+                logger = logging.getLogger(__name__)
+                <|fim_context|>
+
 
                 Example COMPLETION:
                 <|fim_middle|>
-                    validate_numbers(a, b)
-                    result = a + b
-                    logging.debug(f"Adding {{a}} and {{b}}, result = {{result}}")
+                filtered = []
+                for number in numbers:
+                    if is_even(number):
+                        filtered.append(number)
+                        logger.debug(f"Number  is even and added to the list.")
 
                 # === [END EXAMPLE] ===
 
@@ -1219,7 +1308,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 context_parts.append(refined_context)
                 used_tokens += count_tokens(refined_context)
                 total_tokens_used = used_tokens
-                debug_dir = "iterative_rag_debug_dir"
+                debug_dir = "iterative_rag_debug_dir_3_chunks"
                 # Optional Debug Dump
                 if debug_dir:
                     os.makedirs(debug_dir, exist_ok=True)
@@ -1263,8 +1352,8 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
 
-            if strategy not in ["unixcoder_embedding_top_5_chunks_with_metadata_limited_chunktokens_512_reversed_order", "bm25_chunks_text_info_hint", "bm25_chunks_limited_6k", "bm25_chunks_above_percentile", "bm25_chunks_target_file_text_info", "bm25_chunks_text_info_px_mid_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
-                                , "bm25_top_5_chunks_attached_with_file_desc_refined_prompt", "bm25_chunks_target_file_and_mis_code_text_info"
+            if strategy not in ["unix_emb_top_3_basic_chunks_512_tokens_with_metadata_reversed_order", "bm25_chunks_text_info_hint", "bm25_chunks_limited_6k", "bm25_chunks_above_percentile", "bm25_top_5_chunks_target_file_text_info", "bm25_chunks_text_info_px_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
+                                , "bm25_top_5_chunks_attached_with_file_desc_refined_prompt", "bm25_chunks_target_file_and_mis_code_text_info",  "bm25_top_5_chunks_methods_only", "bm25_iterative_rag_3_chunks"
                     ]:
                 for file_path in selected_files:
                     if not file_path:

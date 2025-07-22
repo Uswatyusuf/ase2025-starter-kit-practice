@@ -2,10 +2,26 @@ from tree_sitter import Language,Parser
 import tree_sitter_python as tspython
 import tree_sitter_kotlin as ts_kotlin
 from transformers import AutoTokenizer
+from langchain_ollama import OllamaLLM
+import re
 
 file_path = "data/repositories-python-practice/celery__kombu-7f9674419b585921b1da4ecbd5f3dc203891955e/kombu/utils/eventio.py"
-tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+mellum_tokenizer = AutoTokenizer.from_pretrained("JetBrains/Mellum-4b-sft-python")
+#tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
 MAX_TOKENS = 512
+
+llm = OllamaLLM(model="qwen3:8b", temperature=0)
+
+SYSTEM_INSTRUCTION_METHOD_DESC = """You are an experienced software engineer.
+
+Below, you are given two partial code fragments: a PREFIX and a SUFFIX from the same source file. Together, these represent parts of a larger file.
+
+Please write a brief, high-level description of the **purpose** of this file, based on the given code. Focus on describing what the file is supposed to do overall (its main functionality or role in the project).
+
+Keep your description short and clear (ideally 1-3 sentences).
+
+"""
+
 # Read the actual file content
 with open(file_path, 'r', encoding='utf-8') as f:
     code = f.read()
@@ -57,130 +73,233 @@ KT_LANGUAGE = Language (ts_kotlin.language())
 #         for chunk in ast_chunks
 #     ]
 
+def summarize_class_purpose(class_name, full_code):
+    prompt = f"""
+    Given the following code, summarize in one sentence what the class '{class_name}' does. Be concise and avoid restating the class name unnecessarily.
 
-# def basic_ast_chunk_code(code: str, lang: str) -> list[str]:
-#     global parser
-#     print("Language; ", lang)
-#     if lang == "python":
-#         parser = Parser(PY_LANGUAGE)
-#     elif lang == "kotlin":
-#         parser = Parser(KT_LANGUAGE)
-#     code_bytes = code.encode("utf-8")
-#     tree = parser.parse(code_bytes)
-#     root = tree.root_node
-#
-#     chunks = []
-#     current_expr_group = []
-#
-#     def flush_expr_group():
-#         if current_expr_group:
-#             chunk_text = "\n".join(
-#                 code_bytes[n.start_byte:n.end_byte].decode("utf-8").strip()
-#                 for n in current_expr_group
-#             )
-#             if chunk_text.strip():
-#                 chunks.append(chunk_text)
-#             current_expr_group.clear()
-#
-#     for node in root.children:
-#         # Skip import statements
-#         if node.type in {"future_import_statement", "import_statement", "import_from_statement"}:
-#             continue
-#
-#         if node.type == "expression_statement":
-#             current_expr_group.append(node)
-#         else:
-#             flush_expr_group()
-#             chunk_text = code_bytes[node.start_byte:node.end_byte].decode("utf-8")
-#             if chunk_text.strip():
-#                 chunks.append(chunk_text)
-#
-#     flush_expr_group()
-#     return chunks
+    Code:
+    {full_code}
+    """
+    response = llm(prompt)
+    clean_response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+    return clean_response
 
-# def clean_chunk_text(text: str) -> str:
-#     lines = [line.rstrip() for line in text.splitlines()]
-#     cleaned = "\n".join(line for line in lines if line.strip())
-#     return cleaned.strip()
-#
-# def ast_chunk_code_with_comments(code: str, lang: str) -> list[str]:
-#     global parser
-#     if lang == "python":
-#         parser = Parser(PY_LANGUAGE)
-#     elif lang == "kotlin":
-#         parser = Parser(KT_LANGUAGE)
-#     else:
-#         raise ValueError(f"Unsupported language: {lang}")
-#
-#     code_bytes = code.encode("utf-8")
-#     tree = parser.parse(code_bytes)
-#     root = tree.root_node
-#
-#     chunks = []
-#     current_expr_group = []
-#
-#     def flush_expr_group():
-#         if current_expr_group:
-#             chunk_text = "\n".join(
-#                 clean_chunk_text(code_bytes[n.start_byte:n.end_byte].decode("utf-8"))
-#                 for n in current_expr_group
-#             )
-#             if chunk_text:
-#                 header = "# Expression Group\n"
-#                 chunks.append(header + chunk_text)
-#             current_expr_group.clear()
-#
-#     for node in root.children:
-#         node_text = code_bytes[node.start_byte:node.end_byte].decode("utf-8")
-#
-#         if node.type in {"future_import_statement", "import_statement", "import_from_statement"}:
-#             continue
-#
-#         if node.type == "expression_statement":
-#             current_expr_group.append(node)
-#         else:
-#             flush_expr_group()
-#
-#             # Detect function or class name
-#             name = None
-#             for child in node.children:
-#                 if child.type == "identifier":
-#                     name = code_bytes[child.start_byte:child.end_byte].decode("utf-8")
-#                     break
-#
-#             if node.type == "function_definition":
-#                 header = f"# Function: {name}\n"
-#             elif node.type == "class_definition":
-#                 header = f"# Class: {name}\n"
-#             else:
-#                 header = f"# {node.type.replace('_', ' ').capitalize()}\n"
-#
-#             chunk_cleaned = clean_chunk_text(node_text)
-#             chunks.append(header + chunk_cleaned)
-#
-#     flush_expr_group()
-#     return chunks
-#
-# def print_ast_structure(code: str):
-#     PY_LANGUAGE = Language(tspython.language())
-#     parser = Parser(PY_LANGUAGE)
-#     code_bytes = code.encode("utf-8")
-#     tree = parser.parse(code_bytes)
-#     root = tree.root_node
-#
-#     print("Root type:", root.type)
-#
-#     for i, node in enumerate(root.children):
-#         node_type = node.type
-#         node_text = code_bytes[node.start_byte:node.end_byte].decode("utf-8").strip()
-#         print(f"--- Node {i+1} ---")
-#         print(f"Type: {node_type}")
-#         print(f"Text:\n{node_text}")
-#         print()
+def chunk_class_methods_with_desc(node, code_bytes, max_tokens, class_purpose):
+    """Chunk class by methods, preserving header, docstring, and adding LLM-generated purpose."""
+    chunks = []
+    header = extract_class_header(node, code_bytes)
+    methods = [c for c in node.children if c.type == "function_definition"]
+
+    class_name = "Unknown"
+    for child in node.children:
+        if child.type == "identifier":
+            class_name = extract_node_text(code_bytes, child)
+            break
+
+    current_chunk = header
+    current_token_count = token_count(current_chunk)
+    included_methods = []
+
+    def flush_chunk():
+        if included_methods:
+            methods_comment = f"# Methods included: {', '.join(included_methods)}\n"
+            purpose_comment = f"# Class: {class_name} (partial)\n# Purpose: {class_purpose}\n" + methods_comment
+            final_chunk = purpose_comment + current_chunk.rstrip()
+            chunks.append(final_chunk)
+
+    for method in methods:
+        method_text = extract_node_text(code_bytes, method)
+        method_text_clean = clean_chunk_text(method_text)
+        method_tokens = token_count(method_text_clean)
+        method_name = "unknown_method"
+        for child in method.children:
+            if child.type == "identifier":
+                method_name = extract_node_text(code_bytes, child)
+                break
+
+        if current_token_count + method_tokens > max_tokens:
+            flush_chunk()
+            current_chunk = header + method_text_clean + "\n"
+            current_token_count = token_count(current_chunk)
+            included_methods = [method_name]
+        else:
+            current_chunk += method_text_clean + "\n"
+            current_token_count += method_tokens
+            included_methods.append(method_name)
+
+    if included_methods:
+        flush_chunk()
+    return chunks
+
+
+def basic_ast_chunk_code(code: str, lang: str) -> list[str]:
+    max_tokens = 500
+    global parser
+    if lang == "python":
+        parser = Parser(PY_LANGUAGE)
+
+    elif lang == "kotlin":
+        parser = Parser(PY_LANGUAGE)
+
+
+    code_bytes = code.encode("utf-8")
+    tree = parser.parse(code_bytes)
+    root = tree.root_node
+
+    chunks = []
+    current_expr_group = []
+
+    def flush_expr_group():
+        if current_expr_group:
+            chunk_text = "\n".join(
+                code_bytes[n.start_byte:n.end_byte].decode("utf-8").strip()
+                for n in current_expr_group
+            )
+            if chunk_text.strip():
+                chunks.append(chunk_text)
+            current_expr_group.clear()
+
+    for node in root.children:
+        if node.type in {"future_import_statement", "import_statement", "import_from_statement", "import_header"}:
+            continue
+
+        if node.type == "expression_statement":
+            current_expr_group.append(node)
+        elif node.type == "class_definition":
+            node_text = extract_node_text(code_bytes, node)
+            node_tokens = token_count(node_text)
+            class_name = "Unknown"
+            for child in node.children:
+                if child.type == "identifier":
+                    class_name = extract_node_text(code_bytes, child)
+                    break
+
+            class_purpose = summarize_class_purpose(class_name, code)
+            print(class_purpose)
+
+            if node_tokens > max_tokens:
+                class_chunks = chunk_class_methods_with_desc(node, code_bytes, max_tokens, class_purpose)
+                chunks.extend(class_chunks)
+            else:
+                purpose_comment = f"# Class: {class_name}\n# Purpose: {class_purpose}\n"
+                chunks.append(purpose_comment + node_text)
+        else:
+            flush_expr_group()
+            chunk_text = code_bytes[node.start_byte:node.end_byte].decode("utf-8")
+            if chunk_text.strip():
+                chunks.append(chunk_text)
+
+    flush_expr_group()
+    return chunks
+
+
+def basic_ast_chunk_code_methods_only(code: str, lang: str) -> list[str]:
+    global parser
+    print("Language; ", lang)
+    if lang == "python":
+        parser = Parser(PY_LANGUAGE)
+    elif lang == "kotlin":
+        parser = Parser(KT_LANGUAGE)
+    code_bytes = code.encode("utf-8")
+    tree = parser.parse(code_bytes)
+    root = tree.root_node
+
+    chunks = []
+
+    def extract_with_decorators(code_bytes, node):
+        """Extract node text including decorators directly attached to it."""
+        decorators = []
+        idx = node.prev_sibling
+        while idx and idx.type == "decorator":
+            decorators.insert(0, extract_node_text(code_bytes, idx).rstrip())
+            idx = idx.prev_sibling
+        node_text = extract_node_text(code_bytes, node).rstrip()
+        return "\n".join(decorators + [node_text])
+
+    def extract_class_decorators(code_bytes, class_node):
+        """Extract decorators attached to the class itself."""
+        decorators = []
+        idx = class_node.prev_sibling
+        while idx and idx.type == "decorated_definition":
+            decorators.insert(0, extract_node_text(code_bytes, idx).rstrip())
+            idx = idx.prev_sibling
+        return "\n".join(decorators).rstrip()
+
+    def extract_class_header_methods_only(node, code_bytes):
+        """Extract only the class header (without methods)."""
+        # From start of class_node to the colon (:), typically first line
+        # Use node.start_byte to node.body.start_byte if available
+        class_name = ""
+        for child in node.children:
+            if child.type == "identifier":
+                class_name = extract_node_text(code_bytes, child)
+                break
+        return f"class {class_name}:"
+
+    for node in root.children:
+        if node.type in {"future_import_statement", "import_statement", "import_from_statement", "import_header"}:
+            continue
+        if node.type == "decorated_definition":
+            print("Decorated function here!!")
+            for c in node.children:
+                if c.type == "class_definition":
+                    class_decorators = extract_class_decorators(code_bytes, node)
+                    class_header = extract_class_header_methods_only(c, code_bytes)
+                    for c_ch in c.children:
+                        if c_ch.type == "block":
+                            for c_ch_ch in c_ch.children:
+                                methods = [c_ch_ch_ch for c_ch_ch_ch in c_ch.children if
+                                           c_ch_ch.type == "function_definition"]
+                                print("Decorated function here!!-----chunked")
+                                for method in methods:
+                                    method_text = extract_with_decorators(code_bytes, method)
+                                    combined = "\n".join(filter(None, [class_decorators, class_header, method_text]))
+                                    chunks.append(combined)
+
+        # Handle class definitions by methods
+        if node.type == "class_definition":
+            class_decorators = extract_class_decorators(code_bytes, node)
+            class_header = extract_class_header_methods_only(node, code_bytes)
+
+            methods = [c for c in node.children if c.type == "function_definition"]
+
+            for method in methods:
+                method_text = extract_with_decorators(code_bytes, method)
+                combined = "\n".join(filter(None, [class_decorators, class_header, method_text]))
+                chunks.append(combined)
+
+        elif node.type == "function_definition":
+            # Handle global functions
+            func_text = extract_with_decorators(code_bytes, node)
+            chunks.append(func_text)
+        else:
+            # Other non-import non-class nodes
+            node_text = extract_node_text(code_bytes, node)
+            if node_text.strip():
+                chunks.append(node_text)
+
+    return chunks
+
+def print_ast_structure(code: str):
+    PY_LANGUAGE = Language(tspython.language())
+    parser = Parser(PY_LANGUAGE)
+    code_bytes = code.encode("utf-8")
+    tree = parser.parse(code_bytes)
+    root = tree.root_node
+
+    print("Root type:", root.type)
+
+    for i, node in enumerate(root.children):
+        node_type = node.type
+        node_text = code_bytes[node.start_byte:node.end_byte].decode("utf-8").strip()
+        print(f"--- Node {i+1} ---")
+        print(f"Type: {node_type}")
+        print(f"Text:\n{node_text}")
+        print()
 
 
 def token_count(text: str) -> int:
-    return len(tokenizer(text, return_tensors="pt", truncation=False)["input_ids"][0])
+    return len(mellum_tokenizer.encode(text, add_special_tokens=False))
 
 def clean_chunk_text(text: str) -> str:
     lines = [line.rstrip() for line in text.splitlines()]
@@ -245,22 +364,12 @@ def chunk_class_methods(node, code_bytes, max_tokens):
     methods = [c for c in node.children if c.type == "function_definition"]
 
     current_chunk = header
-    current_token_count = token_count(current_chunk)
 
     for method in methods:
         method_text = extract_node_text(code_bytes, method)
         method_text_clean = clean_chunk_text(method_text)
-        method_tokens = token_count(method_text_clean)
+        current_chunk += method_text_clean + "\n"
 
-        if current_token_count + method_tokens > max_tokens:
-            # Flush current chunk
-            chunks.append(current_chunk.rstrip())
-            # Start new chunk with header + method
-            current_chunk = header + method_text_clean + "\n"
-            current_token_count = token_count(current_chunk)
-        else:
-            current_chunk += method_text_clean + "\n"
-            current_token_count += method_tokens
 
     if current_chunk.strip():
         chunks.append(current_chunk.rstrip())
@@ -356,101 +465,3 @@ def ast_chunk_code_with_comments(code: str, lang: str, max_tokens=MAX_TOKENS) ->
 
     flush_expr_group()
     return chunks
-#chunk code with context
-def ast_chunk_code_with_context(code: str, lang: str) -> list[str]:
-    global parser
-    if lang == "python":
-        parser = Parser(PY_LANGUAGE)
-    elif lang == "kotlin":
-        parser = Parser(KT_LANGUAGE)
-    else:
-        raise ValueError(f"Unsupported language: {lang}")
-
-    code_bytes = code.encode("utf-8")
-    tree = parser.parse(code_bytes)
-    root = tree.root_node
-
-    chunks = []
-
-    def clean_chunk_text(text: str) -> str:
-        lines = [line.rstrip() for line in text.splitlines()]
-        return "\n".join(line for line in lines if line.strip()).strip()
-
-    def get_name(node):
-        for child in node.children:
-            if child.type == "identifier":
-                return code_bytes[child.start_byte:child.end_byte].decode("utf-8")
-        return None
-
-    def get_docstring(node):
-        for child in node.children:
-            if child.type == "expression_statement":
-                text = code_bytes[child.start_byte:child.end_byte].decode("utf-8")
-                if text.strip().startswith(("'''", '"""')):
-                    return text.strip()
-        return None
-
-    def extract_class_docstrings():
-        class_docs = {}
-        def recurse(node):
-            if node.type == "class_definition":
-                class_name = get_name(node)
-                if class_name:
-                    doc = get_docstring(node)
-                    if doc:
-                        class_docs[class_name] = doc
-            for child in node.children:
-                recurse(child)
-        recurse(root)
-        return class_docs
-
-    class_docs = extract_class_docstrings()
-
-    def get_enclosing_class_name(node):
-        parent = node.parent
-        while parent:
-            if parent.type == "class_definition":
-                return get_name(parent)
-            parent = parent.parent
-        return None
-
-    def process_node(node):
-        if node.type == "function_definition":
-            name = get_name(node)
-            if not name:
-                return
-
-            header = f"# Function: {name}"
-            enclosing_class = get_enclosing_class_name(node)
-            if enclosing_class:
-                header += f"\n# Enclosing class: {enclosing_class}"
-                if enclosing_class in class_docs:
-                    header += f"\n# Class docstring:\n{class_docs[enclosing_class]}"
-
-            docstring = get_docstring(node)
-            if docstring:
-                header += f"\n# Function docstring:\n{docstring}"
-
-            chunk_body = code_bytes[node.start_byte:node.end_byte].decode("utf-8")
-            chunk_text = f"{header}\n{clean_chunk_text(chunk_body)}"
-            chunks.append(chunk_text)
-
-        # Recurse into all children to find nested functions
-        for child in node.children:
-            process_node(child)
-
-    # Process top-level children
-    for child in root.children:
-        process_node(child)
-
-    return chunks
-# language = "python"
-# chunks = basic_ast_chunk_code(code, language)
-# print_ast_structure(code)
-
-
-# with open("debug_chunks_basic.txt", "w", encoding="utf-8") as f:
-#     for i, chunk in enumerate(chunks):
-#         f.write(f"--- Chunk {i+1} ---\n")
-#         f.write(chunk.strip())
-#         f.write("\n\n")
