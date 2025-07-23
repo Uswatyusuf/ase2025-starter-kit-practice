@@ -15,7 +15,8 @@ from tree_sitter import Language, Parser
 
 from rank_bm25 import BM25Okapi
 from langchain_ollama import OllamaLLM
-from chunking import ast_chunk_code_with_comments, basic_ast_chunk_code, basic_ast_chunk_code_methods_only
+from chunking import basic_ast_chunk_code, basic_ast_chunk_code_methods_only, chunk_kotlin_with_full_context, \
+    basic_ast_chunk_code_methods_only_with_desc
 from transformers import AutoTokenizer, AutoModel
 
 PY_LANGUAGE = Language(tspython.language())
@@ -131,8 +132,10 @@ You are given:
 - A PREFIX and a SUFFIX from the same source file.
 - CONTEXT from other relevant files in the same repository.
 
-Your task is to generate the missing middle code between the PREFIX and SUFFIX (Fill in the middle logic).
-Use the CONTEXT to ensure consistency, correctness, and completeness.
+Your task: 
+- Generate the missing middle code between the PREFIX and SUFFIX (Fill in the middle logic).
+- Use the CONTEXT to ensure consistency, correctness, and completeness.
+- Your response should only be the missing code.
 """
 
 
@@ -168,7 +171,10 @@ def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None
             content = f.read()
     except Exception:
         return []
-    chunks = basic_ast_chunk_code_methods_only(content, language)
+    if language == "python":
+        chunks = basic_ast_chunk_code(content)
+    elif language == "kotlin":
+        chunks = chunk_kotlin_with_full_context(content)
     chunk_entries = [(file_path, chunk) for chunk in chunks]
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
@@ -441,7 +447,7 @@ def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: 
         for filename in filenames:
             if filename.endswith(ext):
                 file_path = os.path.join(dirpath, filename)
-                all_chunks.extend(get_chunks_for_file(file_path, chunk_cache, "debug-dir-methods-only"))
+                all_chunks.extend(get_chunks_for_file(file_path, chunk_cache, f"debug-dir-methods-only_{language}"))
 
     chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
     query = prepare_bm25_str(prefix + " " + suffix)
@@ -828,7 +834,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 selected_files = [find_bm25_file(root_directory, datapoint['prefix'], datapoint['suffix'])]
             elif strategy == "bm25_top_4_files":
                 selected_files = find_bm25_top_3_files(root_directory, datapoint['prefix'], datapoint['suffix'])
-            elif strategy == "bm25_top_5_chunks_methods_only":
+            elif strategy == "bm25_top_5_chunks_methods_only_with_desc":
                 top_chunks= bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
                 selected_files = [file_path for file_path, _ in top_chunks]
                 for file_path, chunk_content in top_chunks:
@@ -838,7 +844,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_parts.append(context_part)
                     used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
-                output_file = f"top_chunks_{repo_id}.txt"
+                output_file = f"debug-chunk-methods/top_chunks_{language}_{repo_id}.txt"
                 with open(output_file, "w", encoding="utf-8") as f:
                         f.write(f"# Root Directory: {root_directory}\n\n")
                         for file_path, chunk_content in top_chunks:
@@ -1173,7 +1179,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_parts.append(context_part)
                     used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
-            elif strategy == "bm25_chunks_limited_6k":
+            elif strategy == "bm25_chunks_limited_8k":
                     description_cache = {}
                     top_chunks, total_tokens_used = bm25_chunks_within_limit_sorted_low_to_high(
                         root_directory, datapoint['prefix'], datapoint['suffix'], extension
@@ -1216,7 +1222,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
                 total_tokens_used = used_tokens
 
-            elif strategy == "bm25_iterative_rag_3_chunks":
+            elif strategy == "bm25_iterative_rag_5_chunks_code_as_context":
                 # Step 1: Initial retrieval
                 initial_chunks = bm25_top_n_chunks(root_directory, prefix, suffix, extension)
                 initial_context = ""
@@ -1293,7 +1299,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
                 bootstrap_middle = re.sub(r'<think>.*?</think>', '', bootstrap_middle, flags=re.DOTALL).strip()
                 # Step 3: Refined retrieval
-                refined_query = f"{prefix}\n{bootstrap_middle}"
+                refined_query = f"{bootstrap_middle}"
                 refined_chunks = bm25_top_n_chunks(root_directory, refined_query, "", extension)
                 refined_context = ""
                 for file_path, chunk in refined_chunks:
@@ -1308,7 +1314,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 context_parts.append(refined_context)
                 used_tokens += count_tokens(refined_context)
                 total_tokens_used = used_tokens
-                debug_dir = "iterative_rag_debug_dir_3_chunks"
+                debug_dir = "iterative_rag_debug_dir_5_chunks_potential_code_as_2_context"
                 # Optional Debug Dump
                 if debug_dir:
                     os.makedirs(debug_dir, exist_ok=True)
@@ -1352,8 +1358,8 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
 
-            if strategy not in ["unix_emb_top_3_basic_chunks_512_tokens_with_metadata_reversed_order", "bm25_chunks_text_info_hint", "bm25_chunks_limited_6k", "bm25_chunks_above_percentile", "bm25_top_5_chunks_target_file_text_info", "bm25_chunks_text_info_px_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
-                                , "bm25_top_5_chunks_attached_with_file_desc_refined_prompt", "bm25_chunks_target_file_and_mis_code_text_info",  "bm25_top_5_chunks_methods_only", "bm25_iterative_rag_3_chunks"
+            if strategy not in ["unix_emb_top_3_basic_chunks_512_tokens_with_metadata_reversed_order", "bm25_chunks_text_info_hint", "bm25_chunks_limited_8k", "bm25_chunks_above_percentile", "bm25_top_5_chunks_target_file_text_info", "bm25_chunks_text_info_px_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
+                                , "bm25_top_5_chunks_attached_with_file_desc_refined_prompt", "bm25_chunks_target_file_and_mis_code_text_info",  "bm25_top_5_chunks_methods_only_with_desc", "bm25_iterative_rag_5_chunks_code_as_context"
                     ]:
                 for file_path in selected_files:
                     if not file_path:
