@@ -213,39 +213,6 @@ def trim_rest_code_with_tokenizer(rest_of_code: str, import_tokens: int, max_tok
 
     return '\n'.join(trimmed_lines)
 
-def extract_imports_and_trim_prefix(prefix: str, lang: str, max_tokens: int = 512) -> str:
-    if lang not in ('python', 'kotlin'):
-        raise ValueError(f"Unsupported language: {lang}")
-
-
-    parser= Parser(PY_LANGUAGE if lang == 'python' else KT_LANGUAGE)
-    tree = parser.parse(bytes(prefix, "utf8"))
-    root_node = tree.root_node
-    code_lines = prefix.splitlines()
-
-    # Extract import lines
-    import_lines = []
-    for node in root_node.children:
-        if lang == 'python' and node.type in ('import_statement', 'import_from_statement'):
-            start, end = node.start_point[0], node.end_point[0]
-            import_lines.extend(code_lines[start:end + 1])
-        elif lang == 'kotlin' and node.type == 'import_directive':
-            start, end = node.start_point[0], node.end_point[0]
-            import_lines.extend(code_lines[start:end + 1])
-
-    import_section = '\n'.join(import_lines)
-    rest_of_code = '\n'.join([line for line in code_lines if line not in import_lines])
-
-    import_tokens = count_tokens_unix(import_section)
-    rest_tokens = count_tokens_unix(rest_of_code)
-
-    if import_tokens + rest_tokens <= max_tokens:
-        return prefix
-
-    trimmed_rest_code = trim_rest_code_with_tokenizer(rest_of_code, import_tokens, max_tokens)
-    final_prefix = (import_section + '\n' + trimmed_rest_code).strip()
-    return final_prefix
-
 
 def find_random_file(root_dir: str, min_lines: int = 10) -> str:
     """
@@ -381,14 +348,6 @@ def describe_files_for_top_chunks(top_chunks, description_cache):
 
     return file_descriptions
 
-def get_embedding(text: str) -> np.ndarray:
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512).to(device)
-    with torch.no_grad():
-        outputs = model(**inputs)
-    # Mean pooling of token embeddings
-    embedding = outputs.last_hidden_state.mean(dim=1).squeeze()
-    return embedding.cpu().numpy()
-
 
 def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: int = 10, no_of_files: int = 4) -> List[str]:
     """
@@ -463,6 +422,29 @@ def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: 
 
     return [all_chunks[i] for i in reversed_top_indices]
 
+def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 5) -> list[tuple[str, str]]:
+    all_chunks = []
+    chunk_cache = {}
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.endswith(ext):
+                file_path = os.path.join(dirpath, filename)
+                all_chunks.extend(get_chunks_for_file(file_path, chunk_cache, f"debug-dir-methods-only_{language}"))
+
+    chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
+    query = prepare_bm25_str(prefix + " " + suffix)
+
+    if not chunk_texts:
+        return []
+
+    bm25 = BM25Okapi(chunk_texts)
+    scores = bm25.get_scores(query)
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+
+    reversed_top_indices = top_indices[::-1]
+
+    return [all_chunks[i] for i in reversed_top_indices]
+
 def bm25_top_n_chunks_with_tokens(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 5) -> List[Tuple[str, str, int]]:
     all_chunks = []
     chunk_cache = {}
@@ -486,56 +468,6 @@ def bm25_top_n_chunks_with_tokens(root_dir: str, prefix: str, suffix: str, ext: 
     reversed_top_indices = top_indices[::-1]
     result = []
     for idx in reversed_top_indices:
-        file_path, chunk = all_chunks[idx]
-        token_count = count_tokens(chunk)
-        result.append((file_path, chunk, token_count))
-
-    return result
-
-def embedding_top_n_chunks_with_tokens_unixcoder(
-    root_dir: str,
-    prefix: str,
-    suffix: str,
-    ext: str,
-    lang: str,
-    top_k: int = 3
-) -> List[Tuple[str, str, int]]:
-    all_chunks = []
-    chunk_cache = {}
-
-    prefix = extract_imports_and_trim_prefix(prefix, lang)
-
-    # Step 1: Gather chunks
-    for dirpath, _, filenames in os.walk(root_dir):
-        for filename in filenames:
-            if filename.endswith(ext):
-                file_path = os.path.join(dirpath, filename)
-                chunks = get_chunks_for_file(file_path, chunk_cache)
-                for file_path, chunk in chunks:
-                    all_chunks.append((file_path, chunk))
-
-    if not all_chunks:
-        return []
-
-    chunk_texts = [chunk for _, chunk in all_chunks]
-
-    # Step 2: Embed all chunks
-    chunk_embeddings = np.vstack([get_embedding(chunk) for chunk in chunk_texts])
-    chunk_embeddings /= np.linalg.norm(chunk_embeddings, axis=1, keepdims=True)
-
-    # Step 3: Embed query
-    query_text = prefix + " " + suffix
-    query_embedding = get_embedding(query_text)
-    query_embedding /= np.linalg.norm(query_embedding)
-
-    # Step 4: Cosine similarity
-    similarities = np.dot(chunk_embeddings, query_embedding)
-
-    # Step 5: Top-k indices
-    top_indices = np.argsort(similarities)[-top_k:][::-1]
-
-    result = []
-    for idx in top_indices:
         file_path, chunk = all_chunks[idx]
         token_count = count_tokens(chunk)
         result.append((file_path, chunk, token_count))
@@ -569,24 +501,6 @@ def bm25_top_n_chunks_with_missing_code_description(
 
     reversed_top_indices = top_indices[::-1]
     return [all_chunks[i] for i in reversed_top_indices]
-
-
-def save_chunks_and_tokens(datapoint_id: str, root_directory: str, debug_dir: str, chunks_result: List[Tuple[str, str, int]]):
-
-    os.makedirs(debug_dir, exist_ok=True)
-    chunk_file_path = os.path.join(debug_dir, f"{datapoint_id}_chunks.txt")
-    token_file_path = os.path.join(debug_dir, f"{datapoint_id}_token_stats.txt")
-
-    total_tokens = 0
-
-    with open(chunk_file_path, "w", encoding="utf-8") as chunk_file, open(token_file_path, "w", encoding="utf-8") as token_file:
-        for idx, (file_path, chunk, token_count) in enumerate(chunks_result):
-            clean_file_name = file_path[len(root_directory) + 1:]
-            chunk_file.write(f"--- Chunk {idx + 1}: {clean_file_name} ---\n{chunk.strip()}\n\n")
-            token_file.write(f"Chunk {idx + 1}: {clean_file_name} - {token_count} tokens\n")
-            total_tokens += token_count
-
-        token_file.write(f"\nTotal tokens (top {len(chunks_result)} chunks): {total_tokens}\n")
 
 
 def bm25_chunks_within_limit_sorted_low_to_high(
@@ -853,18 +767,25 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                             f.write(header)
                             f.write(chunk_content)
                             f.write("\n\n")  # Separate chunks clearly
-            elif strategy == "unix_emb_top_3_basic_chunks_512_tokens_with_metadata_reversed_order":
-                top_chunks = embedding_top_n_chunks_with_tokens_unixcoder(root_directory, datapoint['prefix'], datapoint['suffix'],
-                                                           extension, language)
-                save_chunks_and_tokens(repo_id, root_directory, "debug_dir_3_em_unix", top_chunks)
-                selected_files = [file_path for file_path, _, _ in top_chunks]
-                for file_path, chunk_content, _ in top_chunks:
+            elif strategy == "bm25_top_5_chunks_methods_only_with_desc":
+                top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
+                selected_files = [file_path for file_path, _ in top_chunks]
+                for file_path, chunk_content in top_chunks:
                     clean_file_name = file_path[len(root_directory) + 1:]
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
                                                               file_content=chunk_content)
                     context_parts.append(context_part)
                     used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
+                output_file = f"debug-chunk-methods/top_chunks_{language}_{repo_id}.txt"
+                with open(output_file, "w", encoding="utf-8") as f:
+                    f.write(f"# Root Directory: {root_directory}\n\n")
+                    for file_path, chunk_content in top_chunks:
+                        clean_file_name = file_path[len(root_directory) + 1:]
+                        header = f"## File: {clean_file_name}\n"
+                        f.write(header)
+                        f.write(chunk_content)
+                        f.write("\n\n")  # Separate chunks clearly
             elif strategy == "bm25_chunks_text_info_mid_hint_no_other_context":
                 # STEP 1: Get original prefix/suffix
                 original_prefix = datapoint["prefix"]
@@ -1195,15 +1116,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                         used_tokens += count_tokens(part)
 
                     total_tokens_used = used_tokens
-                    # selected_files = [file_path for file_path, _ in top_chunks]
-                    # for file_path, chunk_content in top_chunks:
-                    #     clean_file_name = file_path[len(root_directory) + 1:]
-                    #     context_part = FILE_COMPOSE_FORMAT.format(
-                    #         file_sep=FILE_SEP_SYMBOL,
-                    #         file_name=clean_file_name,
-                    #         file_content=chunk_content
-                    #     )
-                    #     context_parts.append(context_part)
             elif strategy == "bm25_top_5_chunks_attached_with_file_desc_refined_prompt":
                 description_cache = {}
                 top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'],
