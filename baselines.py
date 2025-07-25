@@ -1,12 +1,13 @@
-from dataclasses import dataclass
+from collections import defaultdict
 from typing import List, Tuple
 import csv
 import matplotlib.pyplot as plt
 import tiktoken
 import random
 import argparse
-import os, jsonlines, concurrent.futures, re
-from tqdm import tqdm
+import os, jsonlines, re
+import json
+
 import numpy as np
 import torch
 import tree_sitter_python as tspython
@@ -18,6 +19,10 @@ from langchain_ollama import OllamaLLM
 from chunking import basic_ast_chunk_code, basic_ast_chunk_code_methods_only, chunk_kotlin_with_full_context, \
     basic_ast_chunk_code_methods_only_with_desc
 from transformers import AutoTokenizer, AutoModel
+
+from prefix_suffix_ast_analysis import extract_prefix_from_last_block, extract_suffix_to_next_block
+from prefix_suffix_ast_analysis_kt import extract_prefix_from_last_block_kt, extract_suffix_to_next_block_kt
+from testing_groq import AGENT_RERANK_PROMPT_TEMPLATE, GroqClient
 
 PY_LANGUAGE = Language(tspython.language())
 KT_LANGUAGE = Language (ts_kotlin.language())
@@ -172,7 +177,7 @@ def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None
     except Exception:
         return []
     if language == "python":
-        chunks = basic_ast_chunk_code(content)
+        chunks = basic_ast_chunk_code_methods_only(content, language)
     elif language == "kotlin":
         chunks = chunk_kotlin_with_full_context(content)
     chunk_entries = [(file_path, chunk) for chunk in chunks]
@@ -199,19 +204,77 @@ def assemble_context(top_chunks, file_descriptions, root_dir):
         context_parts.append(context_part)
     return context_parts
 
-def trim_rest_code_with_tokenizer(rest_of_code: str, import_tokens: int, max_tokens: int) -> str:
-    rest_lines = rest_of_code.splitlines()
-    trimmed_lines = []
-    total_tokens = import_tokens
+def deduplicate_chunks(chunks: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    seen = set()
+    deduped = []
+    for path, chunk in chunks:
+        key = hash(chunk)
+        if key not in seen:
+            seen.add(key)
+            deduped.append((path, chunk))
+    return deduped
 
-    for line in reversed(rest_lines):
-        line_token_count = count_tokens_unix(line)
-        if total_tokens + line_token_count > max_tokens:
-            break
-        trimmed_lines.insert(0, line)
-        total_tokens += line_token_count
+def reciprocal_rank_fusion(rankings: list[list[int]], k: int = 60) -> list[int]:
+    scores = defaultdict(float)
+    for ranking in rankings:
+        for rank, idx in enumerate(ranking):
+            scores[idx] += 1.0 / (k + rank)
+    return [idx for idx, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
 
-    return '\n'.join(trimmed_lines)
+def extract_first_json_object(text: str) -> str:
+    """Extracts the first JSON object from a string."""
+    brace_stack = []
+    start_index = None
+
+    for i, char in enumerate(text):
+        if char == '{':
+            if not brace_stack:
+                start_index = i
+            brace_stack.append(char)
+        elif char == '}':
+            if brace_stack:
+                brace_stack.pop()
+                if not brace_stack and start_index is not None:
+                    return text[start_index:i+1]
+    raise ValueError("No complete JSON object found in LLM response.")
+
+def rerank_with_llm_as_judge(chunks: list[tuple[str, str]], prefix: str, suffix: str, top_k: int, groq_client) -> list[tuple[str, str]]:
+    formatted_snippets = []
+    for i, (_, chunk) in enumerate(chunks):
+        chunk_id = f"CHUNK_{i+1}"
+        formatted_snippets.append(f"{chunk_id}:\n{chunk.strip()}\n")
+
+    prompt = AGENT_RERANK_PROMPT_TEMPLATE.format(prefix, suffix, "\n".join(formatted_snippets))
+    response = groq_client.formatAndSend(prompt)
+
+    try:
+        json_str = extract_first_json_object(response)
+        parsed = json.loads(json_str)
+
+        chunk_id_map = {f"CHUNK_{i + 1}": chunk for i, chunk in enumerate(chunks)}  # 👈 Move here
+
+        print("\n🤖 [LLM RE-RANKING]:")
+        for i, chunk_id in enumerate(parsed.get("files", [])):
+            if chunk_id not in chunk_id_map:
+                continue
+            path, code = chunk_id_map[chunk_id]
+            first_line = code.strip().splitlines()[0] if code.strip() else "<empty>"
+            print(f"Rank {len(parsed['files']) - i}: {chunk_id} - {path}")
+            print(f"Code (first line): {first_line[:80]}")
+
+    except Exception as e:
+        raise ValueError(f"Failed to parse JSON from LLM response: {response}") from e
+
+    ordered_chunks = []
+    for chunk_id in parsed.get("files", []):
+        if chunk_id not in chunk_id_map:
+            print(f"[Warning] Unknown chunk ID returned by LLM: {chunk_id}")
+            continue
+        ordered_chunks.append(chunk_id_map[chunk_id])
+
+    return ordered_chunks[:top_k][::-1]  # From least to top best
+
+
 
 
 def find_random_file(root_dir: str, min_lines: int = 10) -> str:
@@ -422,7 +485,17 @@ def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: 
 
     return [all_chunks[i] for i in reversed_top_indices]
 
-def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 5) -> list[tuple[str, str]]:
+def bm25_top_n_chunks_trimmed_px_sx(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 6) -> list[tuple[str, str]]:
+    global extracted_prefix, extracted_suffix
+    code_bytes = (prefix + suffix).encode("utf-8")
+    px_code_bytes = prefix.encode("utf-8")
+    caret_offset = len(prefix.encode("utf-8"))
+    if language == "python":
+        extracted_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
+        extracted_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
+    elif language == "kotlin":
+        extracted_prefix = extract_prefix_from_last_block_kt(code_bytes, caret_offset)
+        extracted_suffix = extract_suffix_to_next_block_kt(code_bytes, caret_offset)
     all_chunks = []
     chunk_cache = {}
     for dirpath, _, filenames in os.walk(root_dir):
@@ -432,7 +505,7 @@ def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: 
                 all_chunks.extend(get_chunks_for_file(file_path, chunk_cache, f"debug-dir-methods-only_{language}"))
 
     chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
-    query = prepare_bm25_str(prefix + " " + suffix)
+    query = prepare_bm25_str(extracted_prefix + " " + extracted_suffix)
 
     if not chunk_texts:
         return []
@@ -444,6 +517,60 @@ def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: 
     reversed_top_indices = top_indices[::-1]
 
     return [all_chunks[i] for i in reversed_top_indices]
+
+
+def bm25_top_n_chunks_trimmed_px_sx_two_diff_rankings(
+    root_dir: str,
+    prefix: str,
+    suffix: str,
+    ext: str,
+    top_k: int = 5
+) -> list[tuple[str, str]]:
+    code_bytes = (prefix + suffix).encode("utf-8")
+    px_code_bytes = prefix.encode("utf-8")
+    caret_offset = len(prefix.encode("utf-8"))
+
+    extracted_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
+    extracted_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
+
+    all_chunks = []
+    chunk_cache = {}
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.endswith(ext):
+                file_path = os.path.join(dirpath, filename)
+                all_chunks.extend(get_chunks_for_file(file_path, chunk_cache, f"debug-dir-methods-only_{language}"))
+
+    if not all_chunks:
+        return []
+
+    chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
+    first_query = prepare_bm25_str(extracted_prefix + " " + extracted_suffix)
+    second_query = prepare_bm25_str(prefix + " " + suffix)
+
+    bm25 = BM25Okapi(chunk_texts)  # tokenized
+
+    first_scores = bm25.get_scores(first_query)
+    second_scores = bm25.get_scores(second_query)
+
+    first_top = sorted(range(len(first_scores)), key=lambda i: first_scores[i], reverse=True)[:top_k]
+    second_top = sorted(range(len(second_scores)), key=lambda i: second_scores[i], reverse=True)[:top_k]
+
+    # RRF fusion
+    combined_indices = reciprocal_rank_fusion([first_top, second_top])
+
+    # Deduplicate based on content hash, and return top_k
+    final_indices = []
+    seen_hashes = set()
+    for idx in combined_indices:
+        chunk_hash = hash(all_chunks[idx][1])
+        if chunk_hash not in seen_hashes:
+            seen_hashes.add(chunk_hash)
+            final_indices.append(idx)
+        if len(final_indices) >= top_k:
+            break
+
+    return [all_chunks[i] for i in reversed(final_indices)]
 
 def bm25_top_n_chunks_with_tokens(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 5) -> List[Tuple[str, str, int]]:
     all_chunks = []
@@ -624,6 +751,62 @@ def bm25_chunks_above_percentile(
 
     return sorted(included_chunks, key=lambda x: scores[all_chunks.index(x)], reverse=True)
 
+def clean_json_string(response: str) -> str:
+    # Remove ```json or ``` if present
+    return re.sub(r"^```(?:json)?\s*|\s*```$", "", response.strip(), flags=re.IGNORECASE | re.MULTILINE)
+
+
+# llm as a judge
+def bm25_llm_judge_rerank(
+    root_dir: str,
+    prefix: str,
+    suffix: str,
+    ext: str,
+    top_k: int = 5,
+    bm25_pool_size: int = 15
+) -> list[tuple[str, str]]:
+    code_bytes = (prefix + suffix).encode("utf-8")
+    px_code_bytes = prefix.encode("utf-8")
+    caret_offset = len(prefix.encode("utf-8"))
+
+    extracted_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
+    extracted_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
+
+    all_chunks = []
+    chunk_cache = {}
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.endswith(ext):
+                file_path = os.path.join(dirpath, filename)
+                all_chunks.extend(get_chunks_for_file(file_path, chunk_cache, f"debug-dir-methods-only_{language}"))
+
+    if not all_chunks:
+        return []
+
+    chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
+    query = prepare_bm25_str(extracted_prefix + " " + extracted_suffix)
+
+    bm25 = BM25Okapi(chunk_texts)
+    scores = bm25.get_scores(query)
+
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    # For tracking CHUNK IDs
+    bm25_candidates = top_indices[:bm25_pool_size]
+
+    print("🧠 [BM25 RANKING]:")
+    for rank, idx in enumerate(bm25_candidates):
+        path, code = all_chunks[idx]
+        chunk_id = f"CHUNK_{rank + 1}"
+        first_line = code.strip().splitlines()[0] if code.strip() else "<empty>"
+        print(f"Rank {rank + 1}: {chunk_id} - {path}")
+        print(f"Code (first line): {first_line[:80]}")
+
+    candidate_chunks = [all_chunks[i] for i in top_indices[:bm25_pool_size]]
+    groq_client = GroqClient()
+    reranked = rerank_with_llm_as_judge(candidate_chunks, prefix, suffix, top_k, groq_client)
+    return reranked
+
+
 def find_random_recent_file(root_dir: str, recent_filenames: list[str], min_lines: int = 10) -> str:
     """
     Select the most recent file:
@@ -767,8 +950,27 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                             f.write(header)
                             f.write(chunk_content)
                             f.write("\n\n")  # Separate chunks clearly
-            elif strategy == "bm25_top_5_chunks_methods_only_with_desc":
-                top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
+            elif strategy == "bm25_top_6_chunks_trimmed_query_prefix_and_suffix":
+                top_chunks = bm25_top_n_chunks_trimmed_px_sx(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
+                selected_files = [file_path for file_path, _ in top_chunks]
+                for file_path, chunk_content in top_chunks:
+                    clean_file_name = file_path[len(root_directory) + 1:]
+                    context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
+                                                              file_content=chunk_content)
+                    context_parts.append(context_part)
+                    used_tokens += count_tokens(context_part)
+                total_tokens_used = used_tokens
+                output_file = f"debug-chunk-methods/top_chunks_{language}_{repo_id}.txt"
+                with open(output_file, "w", encoding="utf-8") as f:
+                    f.write(f"# Root Directory: {root_directory}\n\n")
+                    for file_path, chunk_content in top_chunks:
+                        clean_file_name = file_path[len(root_directory) + 1:]
+                        header = f"## File: {clean_file_name}\n"
+                        f.write(header)
+                        f.write(chunk_content)
+                        f.write("\n\n")  # Separate chunks clearly
+            elif strategy == "llm_as_judge_top_8_chunks_methods_trimmed_query_prefix_and_suffix":
+                top_chunks = bm25_llm_judge_rerank(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
                 selected_files = [file_path for file_path, _ in top_chunks]
                 for file_path, chunk_content in top_chunks:
                     clean_file_name = file_path[len(root_directory) + 1:]
@@ -1271,8 +1473,8 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 raise ValueError(f"Unknown strategy: {strategy}")
 
             if strategy not in ["unix_emb_top_3_basic_chunks_512_tokens_with_metadata_reversed_order", "bm25_chunks_text_info_hint", "bm25_chunks_limited_8k", "bm25_chunks_above_percentile", "bm25_top_5_chunks_target_file_text_info", "bm25_chunks_text_info_px_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
-                                , "bm25_top_5_chunks_attached_with_file_desc_refined_prompt", "bm25_chunks_target_file_and_mis_code_text_info",  "bm25_top_5_chunks_methods_only_with_desc", "bm25_iterative_rag_5_chunks_code_as_context"
-                    ]:
+                                , "bm25_top_5_chunks_attached_with_file_desc_refined_prompt", "bm25_chunks_target_file_and_mis_code_text_info",  "bm25_top_5_chunks_methods_only_with_desc", "bm25_iterative_rag_5_chunks_code_as_context", "bm25_top_5_chunks_method_lvl_trimmed_query_prefix_and_suffix_2_ranks",
+                                 "bm25_top_5_chunks_min2k_trimmed_query_prefix_and_suffix", "llm_as_judge_top_8_chunks_methods_trimmed_query_prefix_and_suffix", "bm25_top_6_chunks_trimmed_query_prefix_and_suffix"]:
                 for file_path in selected_files:
                     if not file_path:
                         continue

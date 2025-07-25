@@ -6,18 +6,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 AGENT_RERANK_PROMPT_TEMPLATE = """
-You are given a list of files selected as potential candidates to fix the provided issue.
-Re-rank the files, in order of most important to modify.
+You are given a list of code snippets from files in repositories selected as potential candidates to aid a code completion model in completing a code given the 
+PREFIX (partial code segment before the missing code) and SUFFIX (partial code segment after the missing code).
 
-Return the re-ranked list of files in JSON format with a single field 'files'.
+Re-rank the code snippets, in order of which is MOST LIKELY to help a model correctly complete the missing code.
 
-<ISSUE>
+Return a JSON object with a single field 'files' — a list of chunk identifiers (e.g., "CHUNK_1", "CHUNK_2", etc.), ordered from best to least helpful.
+
+<PREFIX>
 {}
-</ISSUE>
+</PREFIX>
 
-<FILES>
+<SUFFIX>
 {}
-</FILES>
+</SUFFIX>
+
+<CODE SNIPPETS>
+{}
+</CODE SNIPPETS>
 """
 
 class GroqClient:
@@ -27,8 +33,10 @@ class GroqClient:
 
     def formatAndSend(self, prompt) -> str:
         messages = [
-            {"role": "system", "content": "You are a coding assistant"},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content":"You are a concise coding assistant. "
+    "Only return the final answer in strict JSON format. "
+    "Do NOT include any explanations, thoughts, or <think> tags."},
+            {"role": "user", "content": prompt}
         ]
         return self.chat(messages)
 
@@ -49,7 +57,8 @@ class GroqClient:
                     model=self.model_name,
                     temperature=0.0,
                     messages=messages,
-                    stream=False
+                    stream=False,
+                    reasoning_effort="none"  # ✅ must be a string!
                 )
                 # Remove <think>...</think> tags and their content
                 clean_content = re.sub(r'<think>.*?</think>', '', response.choices[0].message.content, flags=re.DOTALL)
@@ -71,9 +80,4 @@ class GroqClient:
 issue = "The application crashes when submitting the form."
 files = ["data/repositories-python-practice/celery__kombu-0d3b1e254f9178828f62b7b84f0307882e28e2a0/t/__init__.py", "data/repositories-python-practice/celery__kombu-0d3b1e254f9178828f62b7b84f0307882e28e2a0/t/mocks.py", "data/repositories-python-practice/celery__kombu-0d3b1e254f9178828f62b7b84f0307882e28e2a0/t/unit/test_compat.py"]
 
-prompt = AGENT_RERANK_PROMPT_TEMPLATE.format(issue, "\n".join(files))
 
-groq = GroqClient()
-response = groq.formatAndSend(prompt)
-
-print(response)

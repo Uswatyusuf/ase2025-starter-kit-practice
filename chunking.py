@@ -93,7 +93,8 @@ Give a one-sentence summary of what this class does. Do not explain or reason.
         model='qwen3:8b',
         messages=[{"role": "user", "content": prompt}]
     )
-    return response['message']['content'].strip()
+    return re.sub(r'<think>.*?</think>', '', response['message']['content'], flags=re.DOTALL).strip()
+
 
 def chunk_class_methods_with_desc(node, code_bytes, max_tokens, class_purpose):
     """Chunk class by methods, preserving header, docstring, and adding LLM-generated purpose."""
@@ -243,7 +244,7 @@ def basic_ast_chunk_code_methods_only(code: str, lang: str) -> list[str]:
                 process_class(inner, decorators)
             elif inner and inner.type == "function_definition":
                 method_decorators = extract_decorators_above(inner)
-                full_text = "\n".join(local_imports + decorators + method_decorators + [extract_node_text(inner).rstrip()])
+                full_text = "\n".join( decorators + method_decorators + [extract_node_text(inner).rstrip()])
                 chunks.append(full_text)
 
         elif node.type == "class_definition":
@@ -251,13 +252,13 @@ def basic_ast_chunk_code_methods_only(code: str, lang: str) -> list[str]:
 
         elif node.type == "function_definition":
             method_decorators = extract_decorators_above(node)
-            full_text = "\n".join(local_imports + method_decorators + [extract_node_text(node).rstrip()])
+            full_text = "\n".join(method_decorators + [extract_node_text(node).rstrip()])
             chunks.append(full_text)
 
         else:
             node_text = extract_node_text(node).strip()
             if node_text:
-                full_chunk = "\n".join(local_imports + [node_text])
+                full_chunk = "\n".join([node_text])
                 chunks.append(full_chunk)
 
     return chunks
