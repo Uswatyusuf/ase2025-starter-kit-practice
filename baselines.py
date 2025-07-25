@@ -485,7 +485,7 @@ def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: 
 
     return [all_chunks[i] for i in reversed_top_indices]
 
-def bm25_top_n_chunks_trimmed_px_sx(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 6) -> list[tuple[str, str]]:
+def bm25_top_n_chunks_trimmed_px_sx(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 10) -> list[tuple[str, str]]:
     global extracted_prefix, extracted_suffix
     code_bytes = (prefix + suffix).encode("utf-8")
     px_code_bytes = prefix.encode("utf-8")
@@ -835,16 +835,26 @@ def find_random_recent_file(root_dir: str, recent_filenames: list[str], min_line
     return random.choice(code_files) if code_files else None
 
 def trim_prefix(prefix: str):
-    prefix_lines = prefix.split("\n")
-    if len(prefix_lines) > 10:
-        prefix = "\n".join(prefix_lines[-10:])
-    return prefix
+    global updated_prefix
+    code_bytes = (prefix + suffix).encode("utf-8")
+    px_code_bytes = prefix.encode("utf-8")
+    caret_offset = len(prefix.encode("utf-8"))
+    if language == "python":
+        updated_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
+    elif language == "kotlin":
+        updated_prefix = extract_prefix_from_last_block_kt(code_bytes, caret_offset)
+    return updated_prefix
 
 def trim_suffix(suffix: str):
-    suffix_lines = suffix.split("\n")
-    if len(suffix_lines) > 10:
-        suffix = "\n".join(suffix_lines[:10])
-    return suffix
+    global  updated_suffix
+    code_bytes = (prefix + suffix).encode("utf-8")
+    caret_offset = len(prefix.encode("utf-8"))
+    if language == "python":
+        updated_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
+    elif language == "kotlin":
+        updated_suffix = extract_suffix_to_next_block_kt(code_bytes, caret_offset)
+    return updated_suffix
+
 
 def log_token_usage(token_log_path: str, instance_id: int, files: List[str], token_count: int, prefix_suffix_tokens: int):
     file_list = ", ".join(files)
@@ -950,7 +960,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                             f.write(header)
                             f.write(chunk_content)
                             f.write("\n\n")  # Separate chunks clearly
-            elif strategy == "bm25_top_6_chunks_trimmed_query_prefix_and_suffix":
+            elif strategy == "bm25_top_10_chunks_methods_only_trimmed_query_prefix_and_suffix_and_passed_px_sx":
                 top_chunks = bm25_top_n_chunks_trimmed_px_sx(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
                 selected_files = [file_path for file_path, _ in top_chunks]
                 for file_path, chunk_content in top_chunks:
@@ -1472,7 +1482,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
 
-            if strategy not in ["unix_emb_top_3_basic_chunks_512_tokens_with_metadata_reversed_order", "bm25_chunks_text_info_hint", "bm25_chunks_limited_8k", "bm25_chunks_above_percentile", "bm25_top_5_chunks_target_file_text_info", "bm25_chunks_text_info_px_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
+            if strategy not in [ "bm25_top_10_chunks_methods_only_trimmed_query_prefix_and_suffix_and_passed_px_sx", "bm25_chunks_text_info_hint", "bm25_chunks_limited_8k", "bm25_chunks_above_percentile", "bm25_top_5_chunks_target_file_text_info", "bm25_chunks_text_info_px_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
                                 , "bm25_top_5_chunks_attached_with_file_desc_refined_prompt", "bm25_chunks_target_file_and_mis_code_text_info",  "bm25_top_5_chunks_methods_only_with_desc", "bm25_iterative_rag_5_chunks_code_as_context", "bm25_top_5_chunks_method_lvl_trimmed_query_prefix_and_suffix_2_ranks",
                                  "bm25_top_5_chunks_min2k_trimmed_query_prefix_and_suffix", "llm_as_judge_top_8_chunks_methods_trimmed_query_prefix_and_suffix", "bm25_top_6_chunks_trimmed_query_prefix_and_suffix"]:
                 for file_path in selected_files:
