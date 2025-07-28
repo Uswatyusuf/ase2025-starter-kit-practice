@@ -58,21 +58,24 @@ class GroqClient:
                     temperature=0.0,
                     messages=messages,
                     stream=False,
-                    reasoning_effort="none"  # ✅ must be a string!
+                    reasoning_effort="none"
                 )
-                # Remove <think>...</think> tags and their content
                 clean_content = re.sub(r'<think>.*?</think>', '', response.choices[0].message.content, flags=re.DOTALL)
                 return clean_content
             except APIError as e:
+                print(f"APIError: {e}")
                 if e.status_code == 429:
                     retry_after = e.response.headers.get('retry-after', base_delay)
                     wait_time = max(float(retry_after), base_delay * (2 ** attempt))
                     print(f"Rate limited. Retry #{attempt + 1} in {wait_time:.1f}s")
                     time.sleep(wait_time)
                 else:
+                    print(f"Non-rate limit API error: {e}")
+                    time.sleep(base_delay * (2 ** attempt))
                     continue
-            except:
-                # any other exception, retry
+            except Exception as e:
+                print(f"Unexpected error: {e.__class__.__name__}: {e}")
+                time.sleep(base_delay * (2 ** attempt))
                 continue
         raise RuntimeError(f"Max retries ({max_retries}) exceeded")
 
