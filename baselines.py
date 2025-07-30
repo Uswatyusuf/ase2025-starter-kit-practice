@@ -163,6 +163,12 @@ tokenizer.model_max_length = 4096
 model     = T5EncoderModel.from_pretrained(MODEL_ID)
 model.eval()
 
+EMBED_MODEL_ID = "nvidia/NV-EmbedCode-7b-v1"
+nv_embedder = SentenceTransformer(EMBED_MODEL_ID, trust_remote_code=True)
+
+# Prefix only for queries
+TASK_INSTRUCTION = "Instruct: Retrieve code or text based on user query\nQuery: "
+
 
 def prepare_bm25_str(s: str) -> list[str]:
     return "".join(c if c.isalnum() else " " for c in s.lower()).split()
@@ -278,6 +284,53 @@ def embed_text(text: str, max_len: int = 4096) -> np.ndarray:
 
     return emb / norm
 
+def embed_chunk_nv(chunk_text: str) -> np.ndarray:
+    return nv_embedder.encode(chunk_text, normalize_embeddings=True).cpu().numpy()
+
+
+def embed_text_nv(text: str) -> np.ndarray:
+    emb = nv_embedder.encode(text, normalize_embeddings=True)
+    if isinstance(emb, torch.Tensor):
+        emb = emb.cpu().numpy()
+    return emb
+
+
+def embed_prefix_suffix_nv(prefix: str, suffix: str) -> np.ndarray:
+    query_prefix = "Instruct: Retrieve code or text based on user query\nQuery: "
+
+    # Encode each with prompt wrapping
+    prefix_emb = embed_text_nv(query_prefix + prefix)
+    suffix_emb = embed_text_nv(query_prefix + suffix)
+
+    # Mean pool the two
+    query_emb = (prefix_emb + suffix_emb) / 2
+    return query_emb / np.linalg.norm(query_emb)
+
+
+def embedding_get_top_k_chunks_nv(
+    root_dir: str,
+    prefix: str,
+    suffix: str,
+    ext: str,
+    k: int = 5
+) -> list[tuple[str, str, float]]:
+    query_emb = embed_prefix_suffix_nv(prefix, suffix)  # (D,)
+
+    all_chunks = []
+    chunks_cache = {}
+    for dirpath, _, filenames in os.walk(root_dir):
+        for fn in filenames:
+            if fn.endswith(ext):
+                file_path = os.path.join(dirpath, fn)
+                all_chunks.extend(get_chunks_for_file(file_path, chunks_cache))
+
+    chunk_texts = [chunk for _, chunk in all_chunks]
+    chunk_embs = nv_embedder.encode(chunk_texts, normalize_embeddings=True)  # (N, D)
+
+    sims = util.cos_sim(query_emb, chunk_embs)[0] * 100  # (N,)
+    top_idx = sims.argsort(descending=True)[:k]
+
+    return [(all_chunks[i][0], all_chunks[i][1], float(sims[i])) for i in top_idx]
 
 # 3) cache chunk embeddings so we only encode each once
 @lru_cache(maxsize=None)
@@ -1155,6 +1208,21 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     used_tokens += count_tokens(context_part)
 
                 total_tokens_used = used_tokens
+            elif strategy == "nv_embed_chunks_top_5":
+                top5 = embedding_get_top_k_chunks_nv(root_directory, datapoint['prefix'], datapoint['suffix'],
+                                                  extension)
+
+                for file_path, chunk_content, score in tqdm(top5, desc="Building context from top chunks"):
+                    clean_file_name = file_path[len(root_directory) + 1:]
+                    context_part = FILE_COMPOSE_FORMAT.format(
+                        file_sep=FILE_SEP_SYMBOL,
+                        file_name=clean_file_name,  # Fixed: `clean_name` → `clean_file_name`
+                        file_content=chunk_content
+                    )
+                    context_parts.append(context_part)
+                    used_tokens += count_tokens(context_part)
+
+                total_tokens_used = used_tokens
             elif strategy == "bm25_chunks_text_info_mid_hint_no_other_context":
                 # STEP 1: Get original prefix/suffix
                 original_prefix = datapoint["prefix"]
@@ -1641,7 +1709,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
             if strategy not in [ "bm25_top_5_2k_8_chunks_methods_only_trimmed_query_px_and_sx", "bm25_chunks_text_info_hint", "bm25_chunks_limited_8k", "bm25_chunks_above_percentile", "bm25_top_5_chunks_target_file_text_info", "bm25_chunks_text_info_px_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
                                 , "bm25_top_5_chunks_attached_with_file_desc_refined_prompt", "bm25_chunks_target_file_and_mis_code_text_info",  "bm25_top_5_chunks_methods_only_with_desc", "bm25_iterative_rag_5_chunks_code_as_context", "bm25_top_5_chunks_method_lvl_trimmed_query_prefix_and_suffix_2_ranks",
-                                 "bm25_top_5_chunks_min2k_trimmed_query_prefix_and_suffix", "llm_as_judge_top_10_chunks_methods_trimmed_query_prefix_and_suffix", "bm25_top_6_chunks_trimmed_query_prefix_and_suffix", "embed_chunks_method_lvl_top_10"]:
+                                 "bm25_top_5_chunks_min2k_trimmed_query_prefix_and_suffix", "llm_as_judge_top_10_chunks_methods_trimmed_query_prefix_and_suffix", "bm25_top_6_chunks_trimmed_query_prefix_and_suffix", "embed_chunks_method_lvl_top_10", "nv_embed_chunks_top_5"]:
                 for file_path in selected_files:
                     if not file_path:
                         continue
