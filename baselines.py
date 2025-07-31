@@ -24,6 +24,9 @@ from prefix_suffix_ast_analysis import extract_prefix_from_last_block, extract_s
 from prefix_suffix_ast_analysis_kt import extract_prefix_from_last_block_kt, extract_suffix_to_next_block_kt
 from testing_groq import AGENT_RERANK_PROMPT_TEMPLATE, GroqClient
 from transformers import AutoTokenizer, T5EncoderModel, T5TokenizerFast
+from tree_sitter import Parser
+from collections import defaultdict
+
 import torch
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -287,13 +290,11 @@ def embed_text(text: str, max_len: int = 4096) -> np.ndarray:
 def embed_chunk_nv(chunk_text: str) -> np.ndarray:
     return nv_embedder.encode(chunk_text, normalize_embeddings=True).cpu().numpy()
 
-
 def embed_text_nv(text: str) -> np.ndarray:
     emb = nv_embedder.encode(text, normalize_embeddings=True)
     if isinstance(emb, torch.Tensor):
         emb = emb.cpu().numpy()
     return emb
-
 
 def embed_prefix_suffix_nv(prefix: str, suffix: str) -> np.ndarray:
     query_prefix = "Instruct: Retrieve code or text based on user query\nQuery: "
@@ -306,6 +307,87 @@ def embed_prefix_suffix_nv(prefix: str, suffix: str) -> np.ndarray:
     query_emb = (prefix_emb + suffix_emb) / 2
     return query_emb / np.linalg.norm(query_emb)
 
+def extract_node_text(code_bytes, node):
+    return code_bytes[node.start_byte:node.end_byte].decode("utf-8")
+
+def merge_chunks_into_file_ast_aware(full_code: str, selected_chunks: list[str], lang: str) -> str:
+    code_bytes = full_code.encode("utf-8")
+    parser = Parser(PY_LANGUAGE if lang.lower() == "python" else KT_LANGUAGE)
+    tree = parser.parse(code_bytes)
+    root = tree.root_node
+    selected_text = "\n".join(selected_chunks)
+
+    merged_lines = []
+
+    for node in root.children:
+        text = code_bytes[node.start_byte:node.end_byte].decode("utf-8").strip()
+
+        # 1. Import statements
+        if node.type in {"import_statement", "import_from_statement", "future_import_statement"}:
+            merged_lines.append(text)
+
+        # 2. Class definitions
+        elif node.type == "class_definition":
+            class_name = extract_node_text(code_bytes, node.child_by_field_name("name"))
+            body = node.child_by_field_name("body")
+            class_header = extract_node_text(code_bytes, node).split(":")[0] + ":"
+            methods = []
+
+            for item in body.children if body else []:
+                if item.type == "function_definition":
+                    method_name_node = item.child_by_field_name("name")
+                    if method_name_node:
+                        method_name = extract_node_text(code_bytes, method_name_node)
+                        if method_name in selected_text:
+                            method_text = code_bytes[item.start_byte:item.end_byte].decode("utf-8").strip()
+                            methods.append(method_text)
+
+            if methods:
+                merged_lines.append(class_header)
+                for method in methods:
+                    merged_lines.extend(["    " + line for line in method.splitlines()])
+
+        # 3. Top-level functions
+        elif node.type == "function_definition":
+            func_name = extract_node_text(code_bytes, node.child_by_field_name("name"))
+            if func_name in selected_text:
+                merged_lines.append(text)
+
+        # 4. Top-level expressions/constants
+        elif node.type in {"expression_statement", "assignment", "string"}:
+            if text in selected_text:
+                merged_lines.append(text)
+
+        # 5. Fallback to line-based match
+        elif any(line.strip() in selected_text for line in text.splitlines()):
+            merged_lines.append(text)
+
+    return "\n\n".join(merged_lines)
+
+def ast_merge_chunks_per_file(
+    retrieved_chunks: list[tuple[str, str, float]],
+    lang: str
+) -> list[tuple[str, str, float]]:
+    """
+    Group chunks per file, merge them using AST, and retain max similarity score.
+    """
+    file_to_chunks = defaultdict(list)
+    for file_path, chunk_text, score in retrieved_chunks:
+        file_to_chunks[file_path].append((chunk_text, score))
+
+    merged_results = []
+
+    for file_path, chunk_score_list in file_to_chunks.items():
+        chunk_texts = [chunk for chunk, _ in chunk_score_list]
+        max_score = max(score for _, score in chunk_score_list)
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            full_code = f.read()
+
+        merged_code = merge_chunks_into_file_ast_aware(full_code, chunk_texts, lang)
+        merged_results.append((file_path, merged_code, max_score))
+
+    return sorted(merged_results, key=lambda x: x[2], reverse=True)
 
 def embedding_get_top_k_chunks_nv(
     root_dir: str,
@@ -1211,8 +1293,8 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             elif strategy == "nv_embed_chunks_top_5":
                 top5 = embedding_get_top_k_chunks_nv(root_directory, datapoint['prefix'], datapoint['suffix'],
                                                   extension)
-
-                for file_path, chunk_content, score in tqdm(top5, desc="Building context from top chunks"):
+                merged_top5 = ast_merge_chunks_per_file(top5, lang="python")
+                for file_path, chunk_content, score in tqdm(merged_top5, desc="Building context from top chunks"):
                     clean_file_name = file_path[len(root_directory) + 1:]
                     context_part = FILE_COMPOSE_FORMAT.format(
                         file_sep=FILE_SEP_SYMBOL,
@@ -1279,7 +1361,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
                 # STEP 2: Query LLM for a description
                 fill_prompt = f"""{SYSTEM_INSTRUCTION_BM25_QUERY}
-
                     --- BEGIN PREFIX ---
                     {original_prefix}
                     --- END PREFIX ---
