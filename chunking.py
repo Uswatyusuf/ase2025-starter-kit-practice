@@ -5,11 +5,13 @@ from transformers import AutoTokenizer
 from langchain_ollama import OllamaLLM
 import re
 import ollama
+import torch
+
+from transformers import AutoTokenizer, AutoModel
 
 
-
-file_path = "data/repositories-python-practice/celery__kombu-7f9674419b585921b1da4ecbd5f3dc203891955e/kombu/utils/eventio.py"
-mellum_tokenizer = AutoTokenizer.from_pretrained("JetBrains/Mellum-4b-sft-python")
+file_path = "data/repositories-python-public/buildbot__buildbot-f90c4c10d4dbae54fb2100d0301b78bb22c9d1ab/common/download_release.py"
+mellum_tokenizer = AutoTokenizer.from_pretrained("JetBrains/Mellum-4b-sft-python", trust_remote_code=True, use_fast=False)
 #tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
 MAX_TOKENS = 512
 
@@ -166,7 +168,7 @@ def basic_ast_chunk_code(code: str) -> list[str]:
 
     for node in root.children:
         # Skip import statements
-        if node.type in {"future_import_statement", "import_statement", "import_from_statement"}:
+        if node.type in {"future_import_statement", "import_statement", "import_from_statement", "package_header", "import_list", "import_header", "import_statement"}:
             continue
 
         if node.type == "expression_statement":
@@ -232,7 +234,7 @@ def basic_ast_chunk_code_methods_only(code: str, lang: str) -> list[str]:
 
     # 2. Re-process and extract method/function/class chunks
     for node in root.children:
-        if node.type in {"import_statement", "import_from_statement", "future_import_statement"}:
+        if node.type in {"import_statement", "import_from_statement", "future_import_statement", "expression", "expression_statement"}:
             continue
 
         if node.type == "decorated_definition":
@@ -460,4 +462,5 @@ def basic_ast_chunk_code_methods_only_with_desc(code: str, lang: str) -> list[st
                 chunks.append(node_text)
 
     return chunks
+
 

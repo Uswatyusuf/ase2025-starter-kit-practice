@@ -157,7 +157,7 @@ llm = OllamaLLM(model="qwen3:8b", temperature=0)
 
 llm_code_completion = OllamaLLM(model="qwen2.5-coder:14b")
 
-mellum_tokenizer = AutoTokenizer.from_pretrained("JetBrains/Mellum-4b-sft-python")
+mellum_tokenizer = AutoTokenizer.from_pretrained("JetBrains/Mellum-4b-sft-python",  trust_remote_code=True, use_fast=False)
 
 # 1) load model+tokenizer (once)
 MODEL_ID  = "Salesforce/codet5p-770m"
@@ -387,14 +387,14 @@ def ast_merge_chunks_per_file(
         merged_code = merge_chunks_into_file_ast_aware(full_code, chunk_texts, lang)
         merged_results.append((file_path, merged_code, max_score))
 
-    return sorted(merged_results, key=lambda x: x[2], reverse=True)
+    return sorted(merged_results, key=lambda x: x[2])
 
 def embedding_get_top_k_chunks_nv(
     root_dir: str,
     prefix: str,
     suffix: str,
     ext: str,
-    k: int = 5
+    k: int = 10
 ) -> list[tuple[str, str, float]]:
     query_emb = embed_prefix_suffix_nv(prefix, suffix)  # (D,)
 
@@ -1290,11 +1290,11 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     used_tokens += count_tokens(context_part)
 
                 total_tokens_used = used_tokens
-            elif strategy == "nv_embed_chunks_top_5":
-                top5 = embedding_get_top_k_chunks_nv(root_directory, datapoint['prefix'], datapoint['suffix'],
+            elif strategy == "nv_embed_chunks_method_lvl_top_10":
+                top10 = embedding_get_top_k_chunks_nv(root_directory, datapoint['prefix'], datapoint['suffix'],
                                                   extension)
-                merged_top5 = ast_merge_chunks_per_file(top5, lang="python")
-                for file_path, chunk_content, score in tqdm(merged_top5, desc="Building context from top chunks"):
+                merged_top10 = ast_merge_chunks_per_file(top10, lang="python")
+                for file_path, chunk_content, score in tqdm(merged_top10, desc="Building context from top chunks"):
                     clean_file_name = file_path[len(root_directory) + 1:]
                     context_part = FILE_COMPOSE_FORMAT.format(
                         file_sep=FILE_SEP_SYMBOL,
@@ -1790,7 +1790,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
             if strategy not in [ "bm25_top_5_2k_8_chunks_methods_only_trimmed_query_px_and_sx", "bm25_chunks_text_info_hint", "bm25_chunks_limited_8k", "bm25_chunks_above_percentile", "bm25_top_5_chunks_target_file_text_info", "bm25_chunks_text_info_px_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
                                 , "bm25_top_5_chunks_attached_with_file_desc_refined_prompt", "bm25_chunks_target_file_and_mis_code_text_info",  "bm25_top_5_chunks_methods_only_with_desc", "bm25_iterative_rag_5_chunks_code_as_context", "bm25_top_5_chunks_method_lvl_trimmed_query_prefix_and_suffix_2_ranks",
-                                 "bm25_top_5_chunks_min2k_trimmed_query_prefix_and_suffix", "llm_as_judge_top_10_chunks_methods_trimmed_query_prefix_and_suffix", "bm25_top_6_chunks_trimmed_query_prefix_and_suffix", "embed_chunks_method_lvl_top_10", "nv_embed_chunks_top_5"]:
+                                 "bm25_top_5_chunks_min2k_trimmed_query_prefix_and_suffix", "llm_as_judge_top_10_chunks_methods_trimmed_query_prefix_and_suffix", "bm25_top_6_chunks_trimmed_query_prefix_and_suffix", "embed_chunks_method_lvl_top_10", "nv_embed_chunks_method_lvl_top_10"]:
                 for file_path in selected_files:
                     if not file_path:
                         continue
