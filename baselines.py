@@ -21,7 +21,6 @@ from chunking import basic_ast_chunk_code, basic_ast_chunk_code_methods_only, ch
 from transformers import AutoTokenizer, AutoModel
 from sentence_transformers import SentenceTransformer, util
 from prefix_suffix_ast_analysis import extract_prefix_from_last_block, extract_suffix_to_next_block
-from prefix_suffix_ast_analysis_kt import extract_prefix_from_last_block_kt, extract_suffix_to_next_block_kt
 from testing_groq import AGENT_RERANK_PROMPT_TEMPLATE, GroqClient
 from transformers import AutoTokenizer, T5EncoderModel, T5TokenizerFast
 from tree_sitter import Parser
@@ -172,6 +171,11 @@ nv_embedder = SentenceTransformer(EMBED_MODEL_ID, trust_remote_code=True)
 # Prefix only for queries
 TASK_INSTRUCTION = "Instruct: Retrieve code or text based on user query\nQuery: "
 
+CODERANK_ID = "nomic-ai/CodeRankEmbed"
+coderank = SentenceTransformer(CODERANK_ID, trust_remote_code=True)
+
+# Required for queries (per model card)
+QUERY_PREFIX = "Represent this query for searching relevant code: "
 
 def prepare_bm25_str(s: str) -> list[str]:
     return "".join(c if c.isalnum() else " " for c in s.lower()).split()
@@ -189,7 +193,7 @@ def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None
     except Exception:
         return []
     if language == "python":
-        chunks = basic_ast_chunk_code_methods_only(content, language)
+        chunks = basic_ast_chunk_code(content, language)
     elif language == "kotlin":
         chunks = chunk_kotlin_with_full_context(content)
     chunk_entries = [(file_path, chunk) for chunk in chunks]
@@ -307,6 +311,18 @@ def embed_prefix_suffix_nv(prefix: str, suffix: str) -> np.ndarray:
     query_emb = (prefix_emb + suffix_emb) / 2
     return query_emb / np.linalg.norm(query_emb)
 
+# NEW
+def embed_chunk_coderank(chunk_text: str) -> np.ndarray:
+    return coderank.encode(chunk_text, normalize_embeddings=True, convert_to_numpy=True)
+
+def embed_text_coderank(text: str) -> np.ndarray:
+    return coderank.encode(text, normalize_embeddings=True, convert_to_numpy=True)
+
+def embed_prefix_suffix_coderank(prefix: str, suffix: str) -> np.ndarray:
+    # IMPORTANT: use the model’s required query prefix
+    query = f"{prefix}\n{suffix}"
+    return coderank.encode(QUERY_PREFIX + query, normalize_embeddings=True, convert_to_numpy=True)
+
 def extract_node_text(code_bytes, node):
     return code_bytes[node.start_byte:node.end_byte].decode("utf-8")
 
@@ -414,11 +430,40 @@ def embedding_get_top_k_chunks_nv(
 
     return [(all_chunks[i][0], all_chunks[i][1], float(sims[i])) for i in top_idx]
 
+def embedding_get_top_k_chunks_coderank(
+    root_dir: str,
+    prefix: str,
+    suffix: str,
+    ext: str,
+    k: int = 5
+) -> list[tuple[str, str, float]]:
+    query_emb = embed_prefix_suffix_coderank(prefix, suffix)[0]  # (D,)
+
+    # collect chunks (unchanged)
+    all_chunks, chunks_cache = [], {}
+    for dirpath, _, filenames in os.walk(root_dir):
+        for fn in filenames:
+            if fn.endswith(ext):
+                fp = os.path.join(dirpath, fn)
+                all_chunks.extend(get_chunks_for_file(fp, chunks_cache))
+
+    if not all_chunks:
+        return []
+
+    chunk_texts = [chunk for _, chunk in all_chunks]
+    chunk_embs = coderank.encode(
+        chunk_texts, normalize_embeddings=True, convert_to_numpy=True
+    )  # (N, D)
+
+    # cosine sim (embeddings are already L2-normalized)
+    sims = (chunk_embs @ query_emb)  # (N,)
+    top_idx = np.argsort(sims)[-k:][::-1]
+    return [(all_chunks[i][0], all_chunks[i][1], float(sims[i])) for i in top_idx]
+
 # 3) cache chunk embeddings so we only encode each once
 @lru_cache(maxsize=None)
 def embed_chunk(chunk_text: str) -> np.ndarray:
     return embed_text(chunk_text)
-
 
 def rerank_with_llm_as_judge(chunks: list[tuple[str, str]], prefix: str, suffix: str, top_k: int, groq_client) -> list[tuple[str, str]]:
     formatted_snippets = []
@@ -1780,7 +1825,18 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_parts.append(context_part)
                     used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
-
+            elif strategy == "coderank_embed_chunks_top_5":
+                print("coderank_embed_chunks_top_5")
+                top5 = embedding_get_top_k_chunks_coderank(root_directory, datapoint['prefix'], datapoint['suffix'],
+                                                           extension)
+                merged_top5 = ast_merge_chunks_per_file(top5, lang=language)  # optional, you already have this
+                for file_path, chunk_content, score in tqdm(merged_top5, desc="Building context from top chunks"):
+                    clean_file_name = file_path[len(root_directory) + 1:]
+                    context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
+                                                              file_content=chunk_content)
+                    context_parts.append(context_part)
+                    used_tokens += count_tokens(context_part)
+                total_tokens_used = used_tokens
             elif strategy == "recent":
                 recent_filenames = datapoint['modified']
                 file = find_random_recent_file(root_directory, recent_filenames)
@@ -1790,7 +1846,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
             if strategy not in [ "bm25_top_5_2k_8_chunks_methods_only_trimmed_query_px_and_sx", "bm25_chunks_text_info_hint", "bm25_chunks_limited_8k", "bm25_chunks_above_percentile", "bm25_top_5_chunks_target_file_text_info", "bm25_chunks_text_info_px_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
                                 , "bm25_top_5_chunks_attached_with_file_desc_refined_prompt", "bm25_chunks_target_file_and_mis_code_text_info",  "bm25_top_5_chunks_methods_only_with_desc", "bm25_iterative_rag_5_chunks_code_as_context", "bm25_top_5_chunks_method_lvl_trimmed_query_prefix_and_suffix_2_ranks",
-                                 "bm25_top_5_chunks_min2k_trimmed_query_prefix_and_suffix", "llm_as_judge_top_10_chunks_methods_trimmed_query_prefix_and_suffix", "bm25_top_6_chunks_trimmed_query_prefix_and_suffix", "embed_chunks_method_lvl_top_10", "nv_embed_chunks_top_5"]:
+                                 "bm25_top_5_chunks_min2k_trimmed_query_prefix_and_suffix", "llm_as_judge_top_10_chunks_methods_trimmed_query_prefix_and_suffix", "bm25_top_6_chunks_trimmed_query_prefix_and_suffix", "embed_chunks_method_lvl_top_10", "nv_embed_chunks_top_5", "coderank_embed_chunks_top_5"]:
                 for file_path in selected_files:
                     if not file_path:
                         continue

@@ -1,4 +1,5 @@
 import os
+import json
 import jsonlines
 from tree_sitter import Language, Parser
 import tree_sitter_python as tspython
@@ -80,29 +81,30 @@ def debug_print_functions(code_bytes):
 
 # Set up input path
 language = "python"
-stage = "practice"
+stage = "public"
 completion_points_file = os.path.join("data", f"{language}-{stage}.jsonl")
+gt_file = os.path.join("answers", f"answers-{language}-{stage}.jsonl")
 
-# Process examples
-with jsonlines.open(completion_points_file, 'r') as reader:
-    for instance_id, datapoint in enumerate(reader):
-        prefix = datapoint["prefix"]
-        suffix = datapoint["suffix"]
-        code_bytes = (prefix + suffix).encode("utf-8")
-        px_code_bytes = prefix.encode("utf-8")
-        caret_offset = len(prefix.encode("utf-8"))
-
-        extracted_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
-        extracted_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
-
-        print(f"💡 Extracted prefix {instance_id} (from last top-level block):")
-        print(extracted_prefix)
-        print("💡 Extracted suffix (to next top-level block):")
-        print(extracted_suffix)
-        print("=" * 60)
-
-
-# Track extracted block types
+# # Process examples
+# with jsonlines.open(completion_points_file, 'r') as reader:
+#     for instance_id, datapoint in enumerate(reader):
+#         prefix = datapoint["prefix"]
+#         suffix = datapoint["suffix"]
+#         code_bytes = (prefix + suffix).encode("utf-8")
+#         px_code_bytes = prefix.encode("utf-8")
+#         caret_offset = len(prefix.encode("utf-8"))
+#
+#         extracted_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
+#         extracted_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
+#
+#         print(f"💡 Extracted prefix {instance_id} (from last top-level block):")
+#         print(extracted_prefix)
+#         print("💡 Extracted suffix (to next top-level block):")
+#         print(extracted_suffix)
+#         print("=" * 60)
+#
+#
+# # Track extracted block types
 # block_type_counter = Counter()
 #
 #
@@ -163,3 +165,45 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 # ax.legend()
 # plt.tight_layout()
 # plt.show()
+
+
+# saving extractions to files
+# Output folder
+output_dir = os.path.join("outputs", f"{language}-{stage}")
+os.makedirs(output_dir, exist_ok=True)
+
+# Load ground truth answers into memory
+with jsonlines.open(gt_file, 'r') as gt_reader:
+    ground_truths = list(gt_reader)
+
+# Process and save to .py files
+with jsonlines.open(completion_points_file, 'r') as reader:
+    for instance_id, datapoint in enumerate(reader):
+        prefix = datapoint["prefix"]
+        suffix = datapoint["suffix"]
+        code_bytes = (prefix + suffix).encode("utf-8")
+        px_code_bytes = prefix.encode("utf-8")
+        caret_offset = len(px_code_bytes)
+
+        extracted_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
+        extracted_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
+
+        ground_truth_middle = ground_truths[instance_id]["middle"]
+
+        file_content = f'''# === PREFIX ===
+{extracted_prefix.strip()}
+
+# === MIDDLE ===
+{ground_truth_middle.strip()}
+
+# === SUFFIX ===
+{extracted_suffix.strip()}
+'''
+
+        file_name = f"{instance_id:04d}.py"
+        file_path = os.path.join(output_dir, file_name)
+
+        with open(file_path, "w", encoding="utf-8") as py_file:
+            py_file.write(file_content)
+
+        print(f"✅ Saved {file_path}")

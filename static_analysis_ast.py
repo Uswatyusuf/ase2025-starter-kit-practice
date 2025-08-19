@@ -13,7 +13,8 @@ class ClassMethodExtractor(ast.NodeVisitor):
         self.generic_visit(node)
 
 # Usage
-with open("data/repositories-python-practice/celery__kombu-0d3b1e254f9178828f62b7b84f0307882e28e2a0/t/unit/transport/test_redis.py", 'r') as f:
+with open(
+        "data/repositories-python-practice/celery__kombu-0d3b1e254f9178828f62b7b84f0307882e28e2a0/t/unit/transport/test_redis.py", 'r') as f:
     tree = ast.parse(f.read())
 
 extractor = ClassMethodExtractor()

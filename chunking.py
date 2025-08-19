@@ -8,7 +8,7 @@ import ollama
 
 
 
-file_path = "data/repositories-python-practice/celery__kombu-7f9674419b585921b1da4ecbd5f3dc203891955e/kombu/utils/eventio.py"
+file_path = "data/repositories-python-public/blankly-finance__blankly-4540939864aa9ef867ed514881d431a374d12808/Blankly/blankly_bot.py"
 mellum_tokenizer = AutoTokenizer.from_pretrained("JetBrains/Mellum-4b-sft-python")
 #tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
 MAX_TOKENS = 512

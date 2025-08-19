@@ -68,24 +68,3 @@ def debug_print_top_level_nodes(code_bytes):
         print(f"- {node.type} @ byte {node.start_byte}: {first_line}")
 
 
-# --- Main Processing ---
-language = "kotlin"
-stage = "practice"
-completion_points_file = os.path.join("data", f"{language}-{stage}.jsonl")
-
-with jsonlines.open(completion_points_file, 'r') as reader:
-    for instance_id, datapoint in enumerate(reader):
-        prefix = datapoint["prefix"]
-        suffix = datapoint["suffix"]
-        code_bytes = (prefix + suffix).encode("utf-8")
-
-        caret_offset = len(prefix.encode("utf-8"))
-        extracted_prefix = extract_prefix_from_last_block_kt(code_bytes, caret_offset)
-        extracted_suffix = extract_suffix_to_next_block_kt(code_bytes, caret_offset)
-
-        debug_print_top_level_nodes(code_bytes)
-        print(f"\n💡 Extracted prefix {instance_id} (from last top-level block):")
-        print(extracted_prefix)
-        print("💡 Extracted suffix (to next top-level block):")
-        print(extracted_suffix)
-        print("=" * 60)
