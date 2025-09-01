@@ -1,60 +1,12 @@
 from tree_sitter import Language,Parser
 import tree_sitter_python as tspython
-
-file_path = "data/repositories-python-practice/celery__kombu-7f9674419b585921b1da4ecbd5f3dc203891955e/kombu/utils/eventio.py"
-
-# Read the actual file content
-with open(file_path, 'r', encoding='utf-8') as f:
-    code = f.read()
+import tree_sitter_kotlin as ts_kotlin
 
 
+PY_LANGUAGE = Language(tspython.language())
+KT_LANGUAGE = Language (ts_kotlin.language())
 
-# def cast_chunk_code(code: str, max_chunk_size: int = 1000) -> list[str]:
-#     PY_LANGUAGE = Language(tspython.language())
-#     parser = Parser(PY_LANGUAGE)
-#
-#
-#     tree = parser.parse(code.encode("utf-8"))
-#     root = tree.root_node
-#     code_bytes = code.encode("utf-8")
-#
-#     def get_node_size(node):
-#         return len(code_bytes[node.start_byte:node.end_byte].replace(b" ", b"").replace(b"\n", b""))
-#
-#     def chunk_ast_nodes(nodes):
-#         chunks = []
-#         chunk = []
-#         size = 0
-#
-#         for node in nodes:
-#             node_size = get_node_size(node)
-#             if node_size > max_chunk_size:
-#                 if chunk:
-#                     chunks.append(chunk)
-#                     chunk = []
-#                     size = 0
-#                 subchunks = chunk_ast_nodes(node.children)
-#                 chunks.extend(subchunks)
-#             elif size + node_size > max_chunk_size:
-#                 chunks.append(chunk)
-#                 chunk = [node]
-#                 size = node_size
-#             else:
-#                 chunk.append(node)
-#                 size += node_size
-#
-#         if chunk:
-#             chunks.append(chunk)
-#         return chunks
-#
-#     ast_chunks = chunk_ast_nodes(root.children)
-#     return [
-#         "".join([code_bytes[n.start_byte:n.end_byte].decode("utf-8") for n in chunk])
-#         for chunk in ast_chunks
-#     ]
-
-
-def basic_ast_chunk_code(code: str) -> list[str]:
+def chunk_python(code: str) -> list[str]:
     PY_LANGUAGE = Language(tspython.language())
     parser = Parser(PY_LANGUAGE)
     code_bytes = code.encode("utf-8")
@@ -76,7 +28,7 @@ def basic_ast_chunk_code(code: str) -> list[str]:
 
     for node in root.children:
         # Skip import statements
-        if node.type in {"future_import_statement", "import_statement", "import_from_statement"}:
+        if node.type in {"future_import_statement", "import_statement", "import_from_statement", "package_header", "import_list", "import_header", "import_statement"}:
             continue
 
         if node.type == "expression_statement":
@@ -91,29 +43,61 @@ def basic_ast_chunk_code(code: str) -> list[str]:
     return chunks
 
 
-def print_ast_structure(code: str):
-    PY_LANGUAGE = Language(tspython.language())
-    parser = Parser(PY_LANGUAGE)
+
+
+def chunk_kotlin_method_lvl(code: str) -> list[str]:
+    parser = Parser(KT_LANGUAGE)
     code_bytes = code.encode("utf-8")
     tree = parser.parse(code_bytes)
     root = tree.root_node
+    chunks = []
 
-    print("Root type:", root.type)
+    def extract_text(node):
+        return code_bytes[node.start_byte:node.end_byte].decode("utf-8")
 
-    for i, node in enumerate(root.children):
-        node_type = node.type
-        node_text = code_bytes[node.start_byte:node.end_byte].decode("utf-8").strip()
-        print(f"--- Node {i+1} ---")
-        print(f"Type: {node_type}")
-        print(f"Text:\n{node_text}")
-        print()
+    def get_annotations_and_modifiers(node):
+        items = []
+        sibling = node.prev_sibling
+        while sibling:
+            if sibling.type in {"annotation", "modifiers"}:
+                items.insert(0, extract_text(sibling).strip())
+            elif sibling.type == "comment" and extract_text(sibling).strip().startswith("/**"):
+                items.insert(0, extract_text(sibling).strip())
+            else:
+                break
+            sibling = sibling.prev_sibling
+        return items
 
-chunks = basic_ast_chunk_code(code)
-print_ast_structure(code)
+    def get_parent_context(node):
+        context = []
+        parent = node.parent
+        while parent and parent != root:
+            if parent.type in {"class_declaration", "object_declaration", "interface_declaration"}:
+                context = (
+                    get_annotations_and_modifiers(parent)
+                    + [extract_text(parent).split("{")[0].strip()]
+                    + context
+                )
+            elif parent.type == "companion_object":
+                context = ["companion object"] + context
+            parent = parent.parent
+        return context
 
+    def process_function(node):
+        if node.type != "function_declaration":
+            return
+        annotations = get_annotations_and_modifiers(node)
+        context = get_parent_context(node)
+        method_body = extract_text(node).strip()
+        full = context + annotations + [method_body]
+        chunks.append("\n".join(full))
 
-with open("debug_chunks_basic.txt", "w", encoding="utf-8") as f:
-    for i, chunk in enumerate(chunks):
-        f.write(f"--- Chunk {i+1} ---\n")
-        f.write(chunk.strip())
-        f.write("\n\n")
+    def walk(node):
+        if node.type == "function_declaration":
+            process_function(node)
+        for child in node.children:
+            walk(child)
+
+    walk(root)
+    return chunks
+

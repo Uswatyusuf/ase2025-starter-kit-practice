@@ -1,9 +1,5 @@
-
 from typing import List
-import csv
-import matplotlib.pyplot as plt
 import os
-import tiktoken
 
 import random
 import argparse
@@ -11,9 +7,10 @@ import jsonlines
 import numpy as np
 
 from rank_bm25 import BM25Okapi
-
-
-from chunking import basic_ast_chunk_code
+from chunking import chunk_python, chunk_kotlin_method_lvl
+from prefix_suffix_ast_analysis_kt import extract_prefix_from_last_block_kt, extract_suffix_to_next_block_kt
+from prefix_suffix_ast_analysis_py import extract_prefix_from_last_block, extract_suffix_to_next_block
+from transformers import AutoTokenizer
 
 argparser = argparse.ArgumentParser()
 # Parameters for context collection strategy
@@ -45,12 +42,26 @@ FILE_SEP_SYMBOL = "<|file_sep|>"
 # format to compose context from a file
 FILE_COMPOSE_FORMAT = "{file_sep}{file_name}\n{file_content}"
 
+mellum_tokenizer = AutoTokenizer.from_pretrained("JetBrains/Mellum-4b-sft-python", trust_remote_code=True, use_fast=False)
 
 def prepare_bm25_str(s: str) -> list[str]:
     return "".join(c if c.isalnum() else " " for c in s.lower()).split()
 
-
 def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None) -> list[tuple[str, str]]:
+    """
+        Retrieve or generate code chunks for a given source file.
+
+        This function reads the specified source file and splits it into code chunks
+        using language-specific chunking functions. It caches the results in `chunk_cache` to avoid
+        redundant computation.
+
+        :param file_path: Path to the source code file.
+        :param chunk_cache: A cache mapping file paths to their list of chunks.
+        :param debug_dir: If provided, writes the generated chunks to
+            a `.chunks.txt` file in this directory for debugging purposes.
+
+        :return: List of tuples representing the file path and each code chunk extracted from the file.
+        """
     if file_path in chunk_cache:
         return chunk_cache[file_path]
     try:
@@ -58,7 +69,10 @@ def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None
             content = f.read()
     except Exception:
         return []
-    chunks = basic_ast_chunk_code(content)
+    if language == "python":
+        chunks = chunk_python(content)
+    elif language == "kotlin":
+        chunks = chunk_kotlin_method_lvl(content)
     chunk_entries = [(file_path, chunk) for chunk in chunks]
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
@@ -68,7 +82,6 @@ def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None
                 f.write(f"--- Chunk {i+1} ---\n{chunk.strip()}\n\n")
     chunk_cache[file_path] = chunk_entries
     return chunk_entries
-
 
 
 def find_random_file(root_dir: str, min_lines: int = 10) -> str:
@@ -146,7 +159,7 @@ def find_bm25_file(root_dir: str, prefix: str, suffix: str, min_lines: int = 10)
     return file_names[best_idx] if file_names else None
 
 
-def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: int = 10, no_of_files: int = 3) -> List[str]:
+def find_bm25_top_n_files(root_dir: str, prefix: str, suffix: str, min_lines: int = 10, no_of_files: int = 4) -> List[str]:
     """
     Select the top three files:
         - in the given language
@@ -159,7 +172,7 @@ def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: in
     :param prefix: Prefix of the completion file.
     :param suffix: Suffix of the completion file.
     :param min_lines: Minimum number of lines required in the file.
-    :return:
+    :return: List of tuples representing the file path
     """
 
     corpus = []
@@ -178,8 +191,6 @@ def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: in
                             corpus.append(content)
                             file_names.append(file_path)
                 except Exception as e:
-                    # Optional: handle unreadable files
-                    # print(f"Could not read {file_path}: {e}")
                     pass
 
     query = (prefix + " " + suffix).lower()
@@ -196,7 +207,22 @@ def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: in
     return [file_names[i] for i in reversed_top_indices]
 
 
-def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 5) -> list[tuple[str, str]]:
+def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 3) -> list[tuple[str, str]]:
+    """
+        Retrieve the top-N most relevant code chunks from a repository using BM25 ranking.
+         - in the given language
+        - with the highest BM25 score with the completion file
+        - in the given directory and its subdirectories
+
+
+        :param root_dir: Path to the root directory of the repository to search.
+        :param prefix: Code snippet immediately preceding the masked region.
+        :param suffix: Code snippet immediately following the masked region.
+        :param ext: File extension filter.
+        :param top_k : top-ranked chunks to return, defaults to 3.
+
+        :return: List of tuples representing the file path and chunk content of the top-ranked code chunks
+        """
     all_chunks = []
     chunk_cache = {}
     for dirpath, _, filenames in os.walk(root_dir):
@@ -219,6 +245,130 @@ def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: 
 
     return [all_chunks[i] for i in reversed_top_indices]
 
+def bm25_top_n_chunks_trimmed_px_sx(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 8) -> list[tuple[str, str]]:
+    """
+           Retrieve the top-N most relevant code chunks from a repository using BM25 ranking.
+            - in the given language
+           - with the highest BM25 score with the completion file
+           - in the given directory and its subdirectories
+           - with trimmed prefix and suffix
+
+
+           :param root_dir: Path to the root directory of the repository to search.
+           :param prefix: Code snippet immediately preceding the masked region.
+           :param suffix: Code snippet immediately following the masked region.
+           :param ext: File extension filter.
+           :param top_k : top-ranked chunks to return, defaults to 3.
+
+           :return: List of tuples representing the file path and chunk content of the top-ranked code chunks
+
+   """
+    global extracted_prefix, extracted_suffix
+
+    code_bytes = (prefix + suffix).encode("utf-8")
+    px_code_bytes = prefix.encode("utf-8")
+    caret_offset = len(prefix.encode("utf-8"))
+
+    if language == "python":
+        extracted_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
+        extracted_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
+    elif language == "kotlin":
+        extracted_prefix = extract_prefix_from_last_block_kt(code_bytes, caret_offset)
+        extracted_suffix = extract_suffix_to_next_block_kt(code_bytes, caret_offset)
+
+    all_chunks = []
+    chunk_cache = {}
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.endswith(ext):
+                file_path = os.path.join(dirpath, filename)
+                all_chunks.extend(get_chunks_for_file(file_path, chunk_cache))
+
+    chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
+    query = prepare_bm25_str(extracted_prefix + " " + extracted_suffix)
+
+    if not chunk_texts:
+        return []
+
+    bm25 = BM25Okapi(chunk_texts)
+    scores = bm25.get_scores(query)
+    ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+
+    selected_indices = ranked_indices[:top_k]
+    selected_chunks = [all_chunks[i] for i in selected_indices]
+    return selected_chunks[::-1]
+
+def bm25_top_n_chunks_2k_min_trimmed_px_sx(
+    root_dir: str,
+    prefix: str,
+    suffix: str,
+    ext: str,
+    top_k: int = 5,
+    min_token_threshold: int = 2000,
+    extra_chunk_count: int = 3
+) -> list[tuple[str, str]]:
+    """
+       Retrieve top-ranked code chunks using BM25 ranking with prefix/suffix trimming
+       and a minimum token threshold.
+         3. Ensuring that the combined token count of the selected chunks meets a
+            minimum threshold (`min_token_threshold`). If the threshold is not
+            reached, additional chunks are added incrementally.
+
+
+       :param  root_dir: Root directory of the repository to search for code files.
+       :param  prefix: Code snippet immediately preceding the masked code region.
+       :param  suffix: Code snippet immediately following the masked code region.
+       :param  ext: File extension.
+       :param  top_k: Initial number of top-ranked chunks to select. Defaults to 5.
+       :param    min_token_threshold : Minimum total token count required
+               across selected chunks. Defaults to 2000.
+       :param    extra_chunk_count: Number of additional chunks to add
+               if token threshold is not met. Defaults to 3.
+
+       :return: List of tuples representing the file path and chunk content of the top-ranked code chunks
+       """
+    global extracted_prefix, extracted_suffix
+
+    code_bytes = (prefix + suffix).encode("utf-8")
+    px_code_bytes = prefix.encode("utf-8")
+    caret_offset = len(prefix.encode("utf-8"))
+
+    if language == "python":
+        extracted_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
+        extracted_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
+    elif language == "kotlin":
+        extracted_prefix = extract_prefix_from_last_block_kt(code_bytes, caret_offset)
+        extracted_suffix = extract_suffix_to_next_block_kt(code_bytes, caret_offset)
+
+    all_chunks = []
+    chunk_cache = {}
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.endswith(ext):
+                file_path = os.path.join(dirpath, filename)
+                all_chunks.extend(get_chunks_for_file(file_path, chunk_cache))
+    chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
+    query = prepare_bm25_str(extracted_prefix + " " + extracted_suffix)
+    if not chunk_texts:
+        return []
+
+    bm25 = BM25Okapi(chunk_texts)
+    scores = bm25.get_scores(query)
+    ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+
+    # Start with top_k chunks
+    selected_indices = ranked_indices[:top_k]
+    selected_chunks = [all_chunks[i] for i in selected_indices]
+
+    # Count total tokens
+    total_tokens = sum(count_tokens(chunk[1]) for chunk in selected_chunks)
+
+    # Add more chunks if below threshold
+    if total_tokens < min_token_threshold:
+        additional_indices = ranked_indices[top_k : top_k + extra_chunk_count]
+        selected_indices.extend(additional_indices)
+        selected_chunks = [all_chunks[i] for i in selected_indices]
+    return selected_chunks[::-1]
 
 def bm25_chunks_within_limit_sorted_low_to_high(
     root_dir: str,
@@ -227,6 +377,21 @@ def bm25_chunks_within_limit_sorted_low_to_high(
     ext: str,
     context_limit: int = 8000
 ) -> tuple[list[tuple[str, str]], int]:
+    """
+        Retrieve BM25-ranked code chunks within a token budget,
+        sorted from lowest to highest BM25 relevance.
+
+        :param root_dir: Path to the root directory of the repository.
+        :param prefix: Code snippet preceding the masked code region.
+        :param suffix: Code snippet following the masked code region.
+        :param ext: File extension filter for selecting files.
+        :param context_limit: Maximum number of token.
+           000.
+
+        :return: tuple[list[tuple[str, str]], int]:
+                - List of (file_path, chunk) tuples representing the selected chunks.
+                - total number of tokens used (including prefix, suffix, and chunks).
+        """
     all_chunks = []
     chunk_cache = {}
     for dirpath, _, filenames in os.walk(root_dir):
@@ -238,7 +403,7 @@ def bm25_chunks_within_limit_sorted_low_to_high(
     if not all_chunks:
         return [], 0
 
-    enc = tiktoken.encoding_for_model("gpt-4")
+
     query = prepare_bm25_str(prefix + " " + suffix)
     chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
 
@@ -251,8 +416,8 @@ def bm25_chunks_within_limit_sorted_low_to_high(
     context_parts = []
 
     # Token budget: count prefix + suffix first
-    prefix_tokens = len(enc.encode(prefix))
-    suffix_tokens = len(enc.encode(suffix))
+    prefix_tokens = count_tokens(prefix)
+    suffix_tokens = count_tokens(suffix)
     total_tokens = prefix_tokens + suffix_tokens
 
     for i in ranked_indices:
@@ -264,7 +429,7 @@ def bm25_chunks_within_limit_sorted_low_to_high(
             file_content=chunk_content
         )
 
-        chunk_tokens = len(enc.encode(context_part))
+        chunk_tokens = count_tokens(context_part)
         if total_tokens + chunk_tokens > context_limit:
             break
 
@@ -276,7 +441,6 @@ def bm25_chunks_within_limit_sorted_low_to_high(
             selected_chunks,
             key=lambda x: scores[all_chunks.index(x)]
         )
-
     return selected_chunks, total_tokens
 
 def bm25_chunks_above_percentile(
@@ -285,9 +449,26 @@ def bm25_chunks_above_percentile(
     suffix: str,
     ext: str,
     percentile: float = 90.0,
-    histogram_dir: str = None,
     context_limit: int = 8000,
 ) -> list[tuple[str, str]]:
+    """
+       Select code chunks above a BM25 score percentile threshold:
+           - Searches all files with the given extension in the repository.
+           - Splits files into code chunks and ranks them using BM25.
+           - Selects only chunks with scores at or above the specified percentile.
+           - Greedily adds top-ranked chunks until the context token limit is reached.
+
+       :param root_dir: Root directory of the repository to search.
+       :param prefix: Code snippet preceding the masked code region.
+       :param suffix: Code snippet following the masked code region.
+       :param ext: File extension filter (e.g., ".py", ".kt") for selecting files.
+       :param percentile: Percentile threshold for selecting top BM25-scored chunks.
+                          Defaults to 90.0.
+       :param context_limit: Maximum total token budget for selected chunks (including
+                             prefix and suffix). Defaults to 8000.
+       :return: A list of (file_path, chunk_content) tuples for chunks above the percentile
+                threshold, sorted by BM25 relevance score (highest first).
+       """
     all_chunks = []
     chunk_cache = {}
     for dirpath, _, filenames in os.walk(root_dir):
@@ -307,25 +488,8 @@ def bm25_chunks_above_percentile(
     threshold = np.percentile(scores, percentile)
     selected = [(chunk, score) for chunk, score in zip(all_chunks, scores) if score >= threshold]
 
-    # Plot histogram
-    if histogram_dir:
-        os.makedirs(histogram_dir, exist_ok=True)
-        repo_name = os.path.basename(root_dir)
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.hist(scores, bins=50, color='skyblue', edgecolor='black')
-        ax.axvline(threshold, color='red', linestyle='dashed', linewidth=2,
-                   label=f"{percentile}th percentile = {threshold:.2f}")
-        ax.set_title(f"BM25 Score Distribution for {repo_name}")
-        ax.set_xlabel("BM25 Score")
-        ax.set_ylabel("Number of Chunks")
-        ax.legend()
-        save_path = os.path.join(histogram_dir, f"{repo_name}_bm25_hist.png")
-        plt.tight_layout()
-        plt.savefig(save_path)
-        plt.close()
 
-    enc = tiktoken.encoding_for_model("gpt-4")
-    total_tokens = len(enc.encode(prefix)) + len(enc.encode(suffix))
+    total_tokens = count_tokens(prefix) + count_tokens(suffix)
 
     # Sort by BM25 score high → low for greedy selection
     selected_sorted = sorted(selected, key=lambda x: x[1], reverse=True)
@@ -337,7 +501,7 @@ def bm25_chunks_above_percentile(
             file_name=file_path[len(root_dir) + 1:],
             file_content=chunk_content
         )
-        chunk_tokens = len(enc.encode(context_part))
+        chunk_tokens = count_tokens(context_part)
         if total_tokens + chunk_tokens > context_limit:
             break
         included_chunks.append((file_path, chunk_content))
@@ -375,71 +539,52 @@ def find_random_recent_file(root_dir: str, recent_filenames: list[str], min_line
 
 
 def trim_prefix(prefix: str):
-    prefix_lines = prefix.split("\n")
-    if len(prefix_lines) > 10:
-        prefix = "\n".join(prefix_lines[-10:])
-    return prefix
+    """
+       Extract a trimmed and focused code prefix based on language-specific block boundaries:
+           - Determines the caret position based on the length of the prefix.
+           - Uses language-specific functions to extract the closest enclosing block
+
+       :param prefix: Code snippet preceding the masked code region.
+       :return: Trimmed prefix string extracted from the nearest logical code block.
+       """
+    global updated_prefix
+    code_bytes = (prefix + suffix).encode("utf-8")
+    px_code_bytes = prefix.encode("utf-8")
+    caret_offset = len(prefix.encode("utf-8"))
+    if language == "python":
+        updated_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
+    elif language == "kotlin":
+        updated_prefix = extract_prefix_from_last_block_kt(code_bytes, caret_offset)
+    return updated_prefix
 
 def trim_suffix(suffix: str):
-    suffix_lines = suffix.split("\n")
-    if len(suffix_lines) > 10:
-        suffix = "\n".join(suffix_lines[:10])
-    return suffix
+    """
+        Extract a trimmed and focused code suffix based on language-specific block boundaries:
+            - Determines the caret position based on the prefix length.
+            - Uses language-specific functions to extract the next enclosing block
 
-def estimate_tokens(text: str, model: str = "gpt-4")->int:
-    enc = tiktoken.encoding_for_model(model)
-    return len(enc.encode(text))
+        :param suffix: Code snippet following the masked code region.
+        :return: Trimmed suffix string extracted from the nearest logical code block.
+        """
+    global  updated_suffix
+    code_bytes = (prefix + suffix).encode("utf-8")
+    caret_offset = len(prefix.encode("utf-8"))
+    if language == "python":
+        updated_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
+    elif language == "kotlin":
+        updated_suffix = extract_suffix_to_next_block_kt(code_bytes, caret_offset)
+    return updated_suffix
 
-def log_token_usage(token_log_path: str, instance_id: int, files: List[str], token_count: int, prefix_suffix_tokens: int):
-    file_list = ", ".join(files)
-    file_exists = os.path.isfile(token_log_path)
-    with open(token_log_path, 'a', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['Instance', 'Files', 'PrefixSuffixTokens', 'TotalTokens']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow({
-            'Instance': instance_id,
-            'Files': file_list,
-            'PrefixSuffixTokens': prefix_suffix_tokens,
-            'TotalTokens': token_count
-        })
+def count_tokens(text: str) -> int:
+    """
+        Count the number of tokens in a given text:
+            - Uses the `mellum_tokenizer` to encode the text.
+            - Excludes special tokens from the count.
 
-
-def plot_token_usage_chart(token_log_path: str):
-    instances = []
-    total_tokens = []
-    prefix_suffix_tokens = []
-
-    with open(token_log_path, 'r', encoding='utf-8') as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            instances.append(int(row['Instance']))
-            total = int(row['TotalTokens'])
-            prefix_suffix = int(row['PrefixSuffixTokens'])
-            total_tokens.append(total)
-            prefix_suffix_tokens.append(prefix_suffix)
-
-    # Compute chunk tokens (i.e., total - prefix+suffix)
-    chunk_tokens = [total - prefix for total, prefix in zip(total_tokens, prefix_suffix_tokens)]
-
-    plt.figure(figsize=(14, 6))
-    bar1 = plt.bar(instances, prefix_suffix_tokens, color='#6baed6', label='Prefix + Suffix')
-    bar2 = plt.bar(instances, chunk_tokens, bottom=prefix_suffix_tokens, color='orange', label='Context Chunks')
-
-    plt.axhline(8000, color='orange', linestyle='--', label='8K Token Limit')
-    plt.axhline(16000, color='red', linestyle='--', label='16K Token Limit')
-    plt.xlabel("Code Completion Instance")
-    plt.ylabel("Total Token Count")
-    plt.title("Token Length per Code Completion Context")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("predictions/token_chart.png")
-    plt.show()
-
-# Define the log path
-token_log_path = os.path.join("predictions", f"{language}-{stage}-{strategy}_token_usage.csv")
-
+        :param text: Input text to tokenize.
+        :return: Number of tokens in the text.
+        """
+    return len(mellum_tokenizer.encode(text, add_special_tokens=False))
 
 # Path to the file with completion points
 completion_points_file = os.path.join("data", f"{language}-{stage}.jsonl")
@@ -472,7 +617,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             elif strategy == "bm25":
                 selected_files = [find_bm25_file(root_directory, datapoint['prefix'], datapoint['suffix'])]
             elif strategy == "bm25_top_3_files":
-                selected_files = find_bm25_top_3_files(root_directory, datapoint['prefix'], datapoint['suffix'])
+                selected_files = find_bm25_top_n_files(root_directory, datapoint['prefix'], datapoint['suffix'])
             elif strategy == "bm25_chunks":
                 top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
                 selected_files = [file_path for file_path, _ in top_chunks]
@@ -481,7 +626,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
                                                               file_content=chunk_content)
                     context_parts.append(context_part)
-                    used_tokens += estimate_tokens(context_part)
+                    used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
             elif strategy == "bm25_chunks_limited":
                     top_chunks, total_tokens_used = bm25_chunks_within_limit_sorted_low_to_high(
@@ -516,7 +661,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                         file_content=chunk_content
                     )
                     context_parts.append(context_part)
-                    used_tokens += estimate_tokens(context_part)
+                    used_tokens += count_tokens(context_part)
                 total_tokens_used = used_tokens
 
             elif strategy == "recent":
@@ -540,7 +685,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                             file_content=file_content
                         )
                         context_parts.append(context_part)
-                        used_tokens += estimate_tokens(context_part)
+                        used_tokens += count_tokens(context_part)
                     except Exception as e:
                         print(f"Skipping file {file_path} due to error: {e}")
                         continue
@@ -554,19 +699,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             if args.trim_suffix:
                 submission["suffix"] = trim_suffix(datapoint["suffix"])
 
-            # print(f"Picked files: {[os.path.basename(f) for f in selected_files if f]}")
-            # print(f"Total tokens: {used_tokens}")
             writer.write(submission)
-            submission["prefix"] = prefix
-            submission["suffix"] = suffix
-            prefix_suffix_tokens = estimate_tokens(prefix) + estimate_tokens(suffix)
 
-            log_token_usage(
-                token_log_path=token_log_path,
-                instance_id=instance_id,
-                files=[os.path.basename(f) for f in selected_files if f],
-                token_count=total_tokens_used,
-                prefix_suffix_tokens=prefix_suffix_tokens
-            )
 
-        plot_token_usage_chart(token_log_path)
