@@ -1,4 +1,3 @@
-from collections import defaultdict
 from typing import List, Tuple
 import csv
 import matplotlib.pyplot as plt
@@ -7,30 +6,20 @@ import random
 import argparse
 import os, jsonlines, re
 import json
-
-import numpy as np
-import torch
 import tree_sitter_python as tspython
 import tree_sitter_kotlin as ts_kotlin
-from tree_sitter import Language, Parser
+import numpy as np
 
+from tree_sitter import Language
 from rank_bm25 import BM25Okapi
 from langchain_ollama import OllamaLLM
-from chunking import basic_ast_chunk_code, basic_ast_chunk_code_methods_only, chunk_kotlin_with_full_context, \
-    basic_ast_chunk_code_methods_only_with_desc
-from transformers import AutoTokenizer, AutoModel
-from sentence_transformers import SentenceTransformer, util
-from prefix_suffix_ast_analysis import extract_prefix_from_last_block, extract_suffix_to_next_block
-from testing_groq import AGENT_RERANK_PROMPT_TEMPLATE, GroqClient
-from transformers import AutoTokenizer, T5EncoderModel, T5TokenizerFast
-from tree_sitter import Parser
-from collections import defaultdict
+from chunking import basic_ast_chunk_code, basic_ast_chunk_code_methods_only, chunk_kotlin_method_lvl_full_context
 
-import torch
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from functools import lru_cache
-from tqdm import tqdm
+from prefix_suffix_ast_analysis import extract_prefix_nearest_block, extract_suffix_nearest_block
+from prefix_suffix_ast_analysis_kt import extract_prefix_nearest_block_kt, extract_suffix_nearest_block_kt
+from transformers import AutoTokenizer
+from collections import defaultdict
+from groq import GroqClient, AGENT_RERANK_PROMPT_TEMPLATE
 
 PY_LANGUAGE = Language(tspython.language())
 KT_LANGUAGE = Language (ts_kotlin.language())
@@ -42,8 +31,8 @@ argparser.add_argument("--lang", type=str, default="python", help="Language")
 argparser.add_argument("--strategy", type=str, default="random", help="Context collection strategy")
 
 # Parameters for context trimming
-argparser.add_argument("--trim-prefix", action="store_true", help="Trim the prefix to 10 lines")
-argparser.add_argument("--trim-suffix", action="store_true", help="Trim the suffix to 10 lines")
+argparser.add_argument("--trim-prefix", action="store_true")
+argparser.add_argument("--trim-suffix", action="store_true")
 
 args = argparser.parse_args()
 
@@ -65,9 +54,9 @@ FILE_SEP_SYMBOL = "<|file_sep|>"
 # format to compose context from a file
 FILE_COMPOSE_FORMAT = "{file_sep}{file_name}\n{file_content}"
 
-# Adds ollama for generating textual info
 
-SYSTEM_INSTRUCTION_MID = """You are a professional developer.
+
+SYSTEM_INSTRUCTION_MISSING_CODE = """You are a professional developer.
 
 Below, you are given two partial code fragments: a PREFIX and a SUFFIX from the same source file. Together, these represent parts of a larger file.
 
@@ -82,7 +71,8 @@ Start your sentence with "The part requiring completion" followed by its **likel
 Keep your description clear and concise (1-2 sentences).
 """
 
-SYSTEM_INSTRUCTION_W_TARGET_FILE = """You are an experienced software engineer.
+
+SYSTEM_INSTRUCTION_FOR_TARGET_FILE = """You are an experienced software engineer.
 
 Below, you are given two partial code fragments: a PREFIX and a SUFFIX from the same source file. Together, these represent parts of a larger file.
 
@@ -91,6 +81,7 @@ Please write a brief, high-level description of the **purpose** of this file, ba
 Keep your description short and clear (ideally 1-3 sentences).
 
 """
+
 
 SYSTEM_INSTRUCTION_PREFIX = """You are an experienced software engineer.
 
@@ -158,33 +149,36 @@ llm_code_completion = OllamaLLM(model="qwen2.5-coder:14b")
 
 mellum_tokenizer = AutoTokenizer.from_pretrained("JetBrains/Mellum-4b-sft-python")
 
-# 1) load model+tokenizer (once)
-MODEL_ID  = "Salesforce/codet5p-770m"
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-tokenizer.model_max_length = 4096
-model     = T5EncoderModel.from_pretrained(MODEL_ID)
-model.eval()
-
-EMBED_MODEL_ID = "nvidia/NV-EmbedCode-7b-v1"
-nv_embedder = SentenceTransformer(EMBED_MODEL_ID, trust_remote_code=True)
-
-# Prefix only for queries
-TASK_INSTRUCTION = "Instruct: Retrieve code or text based on user query\nQuery: "
-
-CODERANK_ID = "nomic-ai/CodeRankEmbed"
-coderank = SentenceTransformer(CODERANK_ID, trust_remote_code=True)
-
-# Required for queries (per model card)
-QUERY_PREFIX = "Represent this query for searching relevant code: "
 
 def prepare_bm25_str(s: str) -> list[str]:
     return "".join(c if c.isalnum() else " " for c in s.lower()).split()
 
 def count_tokens(text: str) -> int:
-    # Use tokenizer.encode instead of .tokenize for accuracy
+    """
+           Count the number of tokens in a given text:
+               - Uses the `mellum_tokenizer` to encode the text.
+               - Excludes special tokens from the count.
+
+           :param text: Input text to tokenize.
+           :return: Number of tokens in the text.
+           """
     return len(mellum_tokenizer.encode(text, add_special_tokens=False))
 
 def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None) -> list[tuple[str, str]]:
+    """
+            Retrieve or generate code chunks for a given source file.
+
+            This function reads the specified source file and splits it into code chunks
+            using language-specific chunking functions. It caches the results in `chunk_cache` to avoid
+            redundant computation.
+
+            :param file_path: Path to the source code file.
+            :param chunk_cache: A cache mapping file paths to their list of chunks.
+            :param debug_dir: If provided, writes the generated chunks to
+                a `.chunks.txt` file in this directory for debugging purposes.
+
+            :return: List of tuples representing the file path and each code chunk extracted from the file.
+            """
     if file_path in chunk_cache:
         return chunk_cache[file_path]
     try:
@@ -195,7 +189,7 @@ def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None
     if language == "python":
         chunks = basic_ast_chunk_code(content, language)
     elif language == "kotlin":
-        chunks = chunk_kotlin_with_full_context(content)
+        chunks = chunk_kotlin_method_lvl_full_context(content)
     chunk_entries = [(file_path, chunk) for chunk in chunks]
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
@@ -205,302 +199,6 @@ def get_chunks_for_file(file_path: str, chunk_cache: dict, debug_dir: str = None
                 f.write(f"--- Chunk {i+1} ---\n{chunk.strip()}\n\n")
     chunk_cache[file_path] = chunk_entries
     return chunk_entries
-
-def assemble_context(top_chunks, file_descriptions, root_dir):
-    context_parts = []
-    for file_path, chunk_content in top_chunks:
-        clean_file_name = file_path[len(root_dir) + 1:]
-        file_desc = re.sub(r'<think>.*?</think>', '', file_descriptions[file_path], flags=re.DOTALL).strip()
-
-        context_part = (
-            f"{FILE_SEP_SYMBOL}{clean_file_name}\n"
-            f"# This code snippet comes from this file: {clean_file_name},{file_desc}\n\n "
-            f"{chunk_content.strip()}\n"
-        )
-        context_parts.append(context_part)
-    return context_parts
-
-def deduplicate_chunks(chunks: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    seen = set()
-    deduped = []
-    for path, chunk in chunks:
-        key = hash(chunk)
-        if key not in seen:
-            seen.add(key)
-            deduped.append((path, chunk))
-    return deduped
-
-def reciprocal_rank_fusion(rankings: list[list[int]], k: int = 60) -> list[int]:
-    scores = defaultdict(float)
-    for ranking in rankings:
-        for rank, idx in enumerate(ranking):
-            scores[idx] += 1.0 / (k + rank)
-    return [idx for idx, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
-
-def extract_first_json_object(text: str) -> str:
-    """Extracts the first JSON object from a string."""
-    brace_stack = []
-    start_index = None
-
-    for i, char in enumerate(text):
-        if char == '{':
-            if not brace_stack:
-                start_index = i
-            brace_stack.append(char)
-        elif char == '}':
-            if brace_stack:
-                brace_stack.pop()
-                if not brace_stack and start_index is not None:
-                    return text[start_index:i+1]
-    raise ValueError("No complete JSON object found in LLM response.")
-
-# 2) mean‐pooling embedder
-def embed_text(text: str, max_len: int = 4096) -> np.ndarray:
-    if not text.strip():
-        raise ValueError("❌ Empty or whitespace-only input text for embedding.")
-
-    # 👉 Warn if the input will be truncated
-    token_ids = tokenizer.encode(text, add_special_tokens=True)
-    if len(token_ids) >= max_len:
-        print(f"⚠️ Input text is {len(token_ids)} tokens and will be truncated to {max_len} tokens")
-        print(text)
-
-    toks = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max_len,
-        padding=False,
-        add_special_tokens=True
-    )
-
-    with torch.no_grad():
-        hidden = model(**toks).last_hidden_state  # [1, L, D]
-
-    mask = toks.attention_mask.unsqueeze(-1)  # [1, L, 1]
-    summed = (hidden * mask).sum(dim=1)       # [1, D]
-    counts = mask.sum(dim=1).clamp(min=1)     # [1, 1]
-    emb = (summed / counts).squeeze(0).cpu().numpy()  # [D]
-
-    if np.isnan(emb).any() or np.isinf(emb).any():
-        raise ValueError("❌ Embedding contains NaNs or Infs")
-
-    norm = np.linalg.norm(emb)
-    if norm == 0:
-        raise ValueError("❌ Zero norm in embedding vector — likely due to empty or invalid input")
-
-    return emb / norm
-
-def embed_chunk_nv(chunk_text: str) -> np.ndarray:
-    return nv_embedder.encode(chunk_text, normalize_embeddings=True).cpu().numpy()
-
-def embed_text_nv(text: str) -> np.ndarray:
-    emb = nv_embedder.encode(text, normalize_embeddings=True)
-    if isinstance(emb, torch.Tensor):
-        emb = emb.cpu().numpy()
-    return emb
-
-def embed_prefix_suffix_nv(prefix: str, suffix: str) -> np.ndarray:
-    query_prefix = "Instruct: Retrieve code or text based on user query\nQuery: "
-
-    # Encode each with prompt wrapping
-    prefix_emb = embed_text_nv(query_prefix + prefix)
-    suffix_emb = embed_text_nv(query_prefix + suffix)
-
-    # Mean pool the two
-    query_emb = (prefix_emb + suffix_emb) / 2
-    return query_emb / np.linalg.norm(query_emb)
-
-# NEW
-def embed_chunk_coderank(chunk_text: str) -> np.ndarray:
-    return coderank.encode(chunk_text, normalize_embeddings=True, convert_to_numpy=True)
-
-def embed_text_coderank(text: str) -> np.ndarray:
-    return coderank.encode(text, normalize_embeddings=True, convert_to_numpy=True)
-
-def embed_prefix_suffix_coderank(prefix: str, suffix: str) -> np.ndarray:
-    # IMPORTANT: use the model’s required query prefix
-    query = f"{prefix}\n{suffix}"
-    return coderank.encode(QUERY_PREFIX + query, normalize_embeddings=True, convert_to_numpy=True)
-
-def extract_node_text(code_bytes, node):
-    return code_bytes[node.start_byte:node.end_byte].decode("utf-8")
-
-def merge_chunks_into_file_ast_aware(full_code: str, selected_chunks: list[str], lang: str) -> str:
-    code_bytes = full_code.encode("utf-8")
-    parser = Parser(PY_LANGUAGE if lang.lower() == "python" else KT_LANGUAGE)
-    tree = parser.parse(code_bytes)
-    root = tree.root_node
-    selected_text = "\n".join(selected_chunks)
-
-    merged_lines = []
-
-    for node in root.children:
-        text = code_bytes[node.start_byte:node.end_byte].decode("utf-8").strip()
-
-        # 1. Import statements
-        if node.type in {"import_statement", "import_from_statement", "future_import_statement"}:
-            merged_lines.append(text)
-
-        # 2. Class definitions
-        elif node.type == "class_definition":
-            class_name = extract_node_text(code_bytes, node.child_by_field_name("name"))
-            body = node.child_by_field_name("body")
-            class_header = extract_node_text(code_bytes, node).split(":")[0] + ":"
-            methods = []
-
-            for item in body.children if body else []:
-                if item.type == "function_definition":
-                    method_name_node = item.child_by_field_name("name")
-                    if method_name_node:
-                        method_name = extract_node_text(code_bytes, method_name_node)
-                        if method_name in selected_text:
-                            method_text = code_bytes[item.start_byte:item.end_byte].decode("utf-8").strip()
-                            methods.append(method_text)
-
-            if methods:
-                merged_lines.append(class_header)
-                for method in methods:
-                    merged_lines.extend(["    " + line for line in method.splitlines()])
-
-        # 3. Top-level functions
-        elif node.type == "function_definition":
-            func_name = extract_node_text(code_bytes, node.child_by_field_name("name"))
-            if func_name in selected_text:
-                merged_lines.append(text)
-
-        # 4. Top-level expressions/constants
-        elif node.type in {"expression_statement", "assignment", "string"}:
-            if text in selected_text:
-                merged_lines.append(text)
-
-        # 5. Fallback to line-based match
-        elif any(line.strip() in selected_text for line in text.splitlines()):
-            merged_lines.append(text)
-
-    return "\n\n".join(merged_lines)
-
-def ast_merge_chunks_per_file(
-    retrieved_chunks: list[tuple[str, str, float]],
-    lang: str
-) -> list[tuple[str, str, float]]:
-    """
-    Group chunks per file, merge them using AST, and retain max similarity score.
-    """
-    file_to_chunks = defaultdict(list)
-    for file_path, chunk_text, score in retrieved_chunks:
-        file_to_chunks[file_path].append((chunk_text, score))
-
-    merged_results = []
-
-    for file_path, chunk_score_list in file_to_chunks.items():
-        chunk_texts = [chunk for chunk, _ in chunk_score_list]
-        max_score = max(score for _, score in chunk_score_list)
-
-        with open(file_path, 'r', encoding='utf-8') as f:
-            full_code = f.read()
-
-        merged_code = merge_chunks_into_file_ast_aware(full_code, chunk_texts, lang)
-        merged_results.append((file_path, merged_code, max_score))
-
-    return sorted(merged_results, key=lambda x: x[2], reverse=True)
-
-def embedding_get_top_k_chunks_nv(
-    root_dir: str,
-    prefix: str,
-    suffix: str,
-    ext: str,
-    k: int = 5
-) -> list[tuple[str, str, float]]:
-    query_emb = embed_prefix_suffix_nv(prefix, suffix)  # (D,)
-
-    all_chunks = []
-    chunks_cache = {}
-    for dirpath, _, filenames in os.walk(root_dir):
-        for fn in filenames:
-            if fn.endswith(ext):
-                file_path = os.path.join(dirpath, fn)
-                all_chunks.extend(get_chunks_for_file(file_path, chunks_cache))
-
-    chunk_texts = [chunk for _, chunk in all_chunks]
-    chunk_embs = nv_embedder.encode(chunk_texts, normalize_embeddings=True)  # (N, D)
-
-    sims = util.cos_sim(query_emb, chunk_embs)[0] * 100  # (N,)
-    top_idx = sims.argsort(descending=True)[:k]
-
-    return [(all_chunks[i][0], all_chunks[i][1], float(sims[i])) for i in top_idx]
-
-def embedding_get_top_k_chunks_coderank(
-    root_dir: str,
-    prefix: str,
-    suffix: str,
-    ext: str,
-    k: int = 5
-) -> list[tuple[str, str, float]]:
-    query_emb = embed_prefix_suffix_coderank(prefix, suffix)[0]  # (D,)
-
-    # collect chunks (unchanged)
-    all_chunks, chunks_cache = [], {}
-    for dirpath, _, filenames in os.walk(root_dir):
-        for fn in filenames:
-            if fn.endswith(ext):
-                fp = os.path.join(dirpath, fn)
-                all_chunks.extend(get_chunks_for_file(fp, chunks_cache))
-
-    if not all_chunks:
-        return []
-
-    chunk_texts = [chunk for _, chunk in all_chunks]
-    chunk_embs = coderank.encode(
-        chunk_texts, normalize_embeddings=True, convert_to_numpy=True
-    )  # (N, D)
-
-    # cosine sim (embeddings are already L2-normalized)
-    sims = (chunk_embs @ query_emb)  # (N,)
-    top_idx = np.argsort(sims)[-k:][::-1]
-    return [(all_chunks[i][0], all_chunks[i][1], float(sims[i])) for i in top_idx]
-
-# 3) cache chunk embeddings so we only encode each once
-@lru_cache(maxsize=None)
-def embed_chunk(chunk_text: str) -> np.ndarray:
-    return embed_text(chunk_text)
-
-def rerank_with_llm_as_judge(chunks: list[tuple[str, str]], prefix: str, suffix: str, top_k: int, groq_client) -> list[tuple[str, str]]:
-    formatted_snippets = []
-    for i, (_, chunk) in enumerate(chunks):
-        chunk_id = f"CHUNK_{i+1}"
-        formatted_snippets.append(f"{chunk_id}:\n{chunk.strip()}\n")
-
-    prompt = AGENT_RERANK_PROMPT_TEMPLATE.format(prefix, suffix, "\n".join(formatted_snippets))
-    response = groq_client.formatAndSend(prompt)
-
-    try:
-        json_str = extract_first_json_object(response)
-        parsed = json.loads(json_str)
-
-        chunk_id_map = {f"CHUNK_{i + 1}": chunk for i, chunk in enumerate(chunks)}  # 👈 Move here
-
-        print("\n🤖 [LLM RE-RANKING]:")
-        for i, chunk_id in enumerate(parsed.get("files", [])):
-            if chunk_id not in chunk_id_map:
-                continue
-            path, code = chunk_id_map[chunk_id]
-            first_line = code.strip().splitlines()[0] if code.strip() else "<empty>"
-            print(f"Rank {len(parsed['files']) - i}: {chunk_id} - {path}")
-            print(f"Code (first line): {first_line[:80]}")
-
-    except Exception as e:
-        raise ValueError(f"Failed to parse JSON from LLM response: {response}") from e
-
-    ordered_chunks = []
-    for chunk_id in parsed.get("files", []):
-        if chunk_id not in chunk_id_map:
-            print(f"[Warning] Unknown chunk ID returned by LLM: {chunk_id}")
-            continue
-        ordered_chunks.append(chunk_id_map[chunk_id])
-
-    return ordered_chunks[:top_k][::-1]  # From least to top best
-
 
 def find_random_file(root_dir: str, min_lines: int = 10) -> str:
     """
@@ -530,6 +228,32 @@ def find_random_file(root_dir: str, min_lines: int = 10) -> str:
                     pass
     return random.choice(code_files) if code_files else None
 
+def find_random_recent_file(root_dir: str, recent_filenames: list[str], min_lines: int = 10) -> str:
+    """
+    Select the most recent file:
+        - in the given language
+        - in the given directory and its subdirectories
+        - meeting length requirements
+
+    :param root_dir: Directory to search for files.
+    :param recent_filenames: List of recent files filenames.
+    :param min_lines: Minimum number of lines required in the file.
+    :return: Selected random file or None if no files were found.
+    """
+    code_files = []
+    for filename in recent_filenames:
+        if filename.endswith(extension):
+            file_path = os.path.join(root_dir, filename)
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                    if len(lines) >= min_lines:
+                        code_files.append(file_path)
+            except Exception as e:
+                # Optional: handle unreadable files
+                # print(f"Could not read {file_path}: {e}")
+                pass
+    return random.choice(code_files) if code_files else None
 
 def find_bm25_file(root_dir: str, prefix: str, suffix: str, min_lines: int = 10) -> str:
     """
@@ -575,6 +299,93 @@ def find_bm25_file(root_dir: str, prefix: str, suffix: str, min_lines: int = 10)
 
     return file_names[best_idx] if file_names else None
 
+def find_bm25_top_n_files(root_dir: str, prefix: str, suffix: str, min_lines: int = 10, no_of_files: int = 3) -> List[str]:
+    """
+    Select the top three files:
+        - in the given language
+        - with the highest BM25 score with the completion file
+        - in the given directory and its subdirectories
+        - meeting length requirements
+
+    :param no_of_files:
+    :param root_dir: Directory to search for files.
+    :param prefix: Prefix of the completion file.
+    :param suffix: Suffix of the completion file.
+    :param min_lines: Minimum number of lines required in the file.
+    :return:
+    """
+
+    corpus = []
+    file_names = []
+
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.endswith(extension):
+                file_path = os.path.join(dirpath, filename)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        lines = f.readlines()
+                        if len(lines) >= min_lines:
+                            content = "\n".join(lines)
+                            content = prepare_bm25_str(content)
+                            corpus.append(content)
+                            file_names.append(file_path)
+                except Exception as e:
+                    # Optional: handle unreadable files
+                    # print(f"Could not read {file_path}: {e}")
+                    pass
+
+    query = (prefix + " " + suffix).lower()
+    query = prepare_bm25_str(query)
+
+    bm25 = BM25Okapi(corpus)
+    scores = bm25.get_scores(query)
+
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:no_of_files]
+
+    # Reverse the order to go from lowest of top 3 to highest
+    #reversed_top_indices = top_indices[::-1]
+
+    return [file_names[i] for i in top_indices]
+
+
+def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 5) -> list[tuple[str, str]]:
+    """
+            Retrieve the top-N most relevant code chunks from a repository using BM25 ranking.
+             - in the given language
+            - with the highest BM25 score with the completion file
+            - in the given directory and its subdirectories
+
+
+            :param root_dir: Path to the root directory of the repository to search.
+            :param prefix: Code snippet immediately preceding the masked region.
+            :param suffix: Code snippet immediately following the masked region.
+            :param ext: File extension filter.
+            :param top_k : top-ranked chunks to return, defaults to 3.
+
+            :return: List of tuples representing the file path and chunk content of the top-ranked code chunks
+            """
+    all_chunks = []
+    chunk_cache = {}
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.endswith(ext):
+                file_path = os.path.join(dirpath, filename)
+                all_chunks.extend(get_chunks_for_file(file_path, chunk_cache, f"debug-dir-methods-only_{language}"))
+
+    chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
+    query = prepare_bm25_str(prefix + " " + suffix)
+
+    if not chunk_texts:
+        return []
+
+    bm25 = BM25Okapi(chunk_texts)
+    scores = bm25.get_scores(query)
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+
+    reversed_top_indices = top_indices[::-1]
+
+    return [all_chunks[i] for i in reversed_top_indices]
 
 def describe_file(file_path: str) -> str:
     """
@@ -636,89 +447,24 @@ def describe_files_for_top_chunks(top_chunks, description_cache):
 
     return file_descriptions
 
-
-def find_bm25_top_3_files(root_dir: str, prefix: str, suffix: str, min_lines: int = 10, no_of_files: int = 4) -> List[str]:
+def bm25_top_n_chunks_trimmed_px_sx(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 5, min_token_threshold: int = 2000, extra_chunk_count: int = 3) -> list[tuple[str, str]]:
     """
-    Select the top three files:
-        - in the given language
-        - with the highest BM25 score with the completion file
-        - in the given directory and its subdirectories
-        - meeting length requirements
-
-    :param no_of_files:
-    :param root_dir: Directory to search for files.
-    :param prefix: Prefix of the completion file.
-    :param suffix: Suffix of the completion file.
-    :param min_lines: Minimum number of lines required in the file.
-    :return:
-    """
-
-    corpus = []
-    file_names = []
-
-    for dirpath, dirnames, filenames in os.walk(root_dir):
-        for filename in filenames:
-            if filename.endswith(extension):
-                file_path = os.path.join(dirpath, filename)
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        lines = f.readlines()
-                        if len(lines) >= min_lines:
-                            content = "\n".join(lines)
-                            content = prepare_bm25_str(content)
-                            corpus.append(content)
-                            file_names.append(file_path)
-                except Exception as e:
-                    # Optional: handle unreadable files
-                    # print(f"Could not read {file_path}: {e}")
-                    pass
-
-    query = (prefix + " " + suffix).lower()
-    query = prepare_bm25_str(query)
-
-    bm25 = BM25Okapi(corpus)
-    scores = bm25.get_scores(query)
-
-    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:no_of_files]
-
-    # Reverse the order to go from lowest of top 3 to highest
-    #reversed_top_indices = top_indices[::-1]
-
-    return [file_names[i] for i in top_indices]
+             Retrieve the top-N most relevant code chunks from a repository using BM25 ranking.
+              - in the given language
+             - with the highest BM25 score with the completion file
+             - in the given directory and its subdirectories
+             - with trimmed prefix and suffix
 
 
-def bm25_top_n_chunks(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 5) -> list[tuple[str, str]]:
-    all_chunks = []
-    chunk_cache = {}
-    for dirpath, _, filenames in os.walk(root_dir):
-        for filename in filenames:
-            if filename.endswith(ext):
-                file_path = os.path.join(dirpath, filename)
-                all_chunks.extend(get_chunks_for_file(file_path, chunk_cache, f"debug-dir-methods-only_{language}"))
+             :param root_dir: Path to the root directory of the repository to search.
+             :param prefix: Code snippet immediately preceding the masked region.
+             :param suffix: Code snippet immediately following the masked region.
+             :param ext: File extension filter.
+             :param top_k : top-ranked chunks to return, defaults to 3.
 
-    chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
-    query = prepare_bm25_str(prefix + " " + suffix)
+             :return: List of tuples representing the file path and chunk content of the top-ranked code chunks
 
-    if not chunk_texts:
-        return []
-
-    bm25 = BM25Okapi(chunk_texts)
-    scores = bm25.get_scores(query)
-    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-
-    reversed_top_indices = top_indices[::-1]
-
-    return [all_chunks[i] for i in reversed_top_indices]
-
-def bm25_top_n_chunks_trimmed_px_sx(
-    root_dir: str,
-    prefix: str,
-    suffix: str,
-    ext: str,
-    top_k: int = 5,
-    min_token_threshold: int = 2000,
-    extra_chunk_count: int = 3
-) -> list[tuple[str, str]]:
+     """
     global extracted_prefix, extracted_suffix
 
     code_bytes = (prefix + suffix).encode("utf-8")
@@ -726,11 +472,11 @@ def bm25_top_n_chunks_trimmed_px_sx(
     caret_offset = len(prefix.encode("utf-8"))
 
     if language == "python":
-        extracted_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
-        extracted_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
+        extracted_prefix = extract_prefix_nearest_block(px_code_bytes, caret_offset)
+        extracted_suffix = extract_suffix_nearest_block(code_bytes, caret_offset)
     elif language == "kotlin":
-        extracted_prefix = extract_prefix_from_last_block_kt(code_bytes, caret_offset)
-        extracted_suffix = extract_suffix_to_next_block_kt(code_bytes, caret_offset)
+        extracted_prefix = extract_prefix_nearest_block_kt(code_bytes, caret_offset)
+        extracted_suffix = extract_suffix_nearest_block_kt(code_bytes, caret_offset)
 
     all_chunks = []
     chunk_cache = {}
@@ -766,149 +512,20 @@ def bm25_top_n_chunks_trimmed_px_sx(
     # Optional: reverse if needed
     return selected_chunks[::-1]
 
-MAX_TOKENS = 4096
-
-def embedding_get_top_k_chunks(
-    root_dir: str,
-    prefix: str,
-    suffix: str,
-    ext: str,
-    k: int = 10
-) -> list[tuple[str,str,float]]:
+def bm25_top_n_chunks_with_missing_code_description(root_dir: str, bm25_middle_description: str, ext: str, top_k: int = 5) -> list[tuple[str, str]]:
     """
-    Walk `root_dir`, collect all code chunks, then return the top-k
-    (file_path, chunk_text, score) by cosine similarity to the
-    average(prefix_embed, suffix_embed), with 4K-token fallback.
-    """
-    # --- 1) Prepare the query embedding with fallback if needed ---
-    # Pre‑compute token lengths
-    prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
-    suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+        Retrieve top-ranked code chunks using BM25 relevance scoring:
+            - Walks through the given root directory and finds files matching the extension
+            - Splits files into chunks and prepares them for BM25 scoring
+            - Uses the provided description as a query to rank chunks by semantic similarity
+            - Returns the top N chunks in reverse-ranked order
 
-    # If either side > MAX_TOKENS, extract a smaller block around the caret
-    if len(prefix_ids) > MAX_TOKENS:
-        prefix = (extract_prefix_from_last_block if language=="python"
-                  else extract_prefix_from_last_block_kt)(prefix, MAX_TOKENS)
-    if len(suffix_ids) > MAX_TOKENS:
-        suffix = (extract_suffix_to_next_block if language=="python"
-                  else extract_suffix_to_next_block_kt)(suffix, MAX_TOKENS)
-
-    # Embed & normalize
-    emb_pref = embed_text(prefix, max_len=MAX_TOKENS)
-    emb_suff = embed_text(suffix, max_len=MAX_TOKENS)
-    query_emb = (emb_pref + emb_suff) / 2
-    query_emb /= np.linalg.norm(query_emb)
-
-    # --- 2) Gather all chunks once (you might cache this outside) ---
-    all_chunks = []
-    chunks_cache = {}
-    for dirpath, _, filenames in os.walk(root_dir):
-        for fn in filenames:
-            if fn.endswith(ext):
-                file_path = os.path.join(dirpath, fn)
-                all_chunks.extend(get_chunks_for_file(file_path, chunks_cache))
-
-    # --- 3) Embed chunks & score ---
-    chunk_embs = [embed_chunk(text) for _, text in all_chunks]
-    sims = cosine_similarity(query_emb[np.newaxis, :],
-                            np.vstack(chunk_embs))[0]
-
-    # --- 4) Pick top‑k and return ---
-    top_idx = np.argsort(sims)[-k:][::-1]
-    return [
-        (all_chunks[i][0], all_chunks[i][1], float(sims[i]))
-        for i in top_idx
-    ]
-
-
-def bm25_top_n_chunks_trimmed_px_sx_two_diff_rankings(
-    root_dir: str,
-    prefix: str,
-    suffix: str,
-    ext: str,
-    top_k: int = 5
-) -> list[tuple[str, str]]:
-    code_bytes = (prefix + suffix).encode("utf-8")
-    px_code_bytes = prefix.encode("utf-8")
-    caret_offset = len(prefix.encode("utf-8"))
-
-    extracted_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
-    extracted_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
-
-    all_chunks = []
-    chunk_cache = {}
-    for dirpath, _, filenames in os.walk(root_dir):
-        for filename in filenames:
-            if filename.endswith(ext):
-                file_path = os.path.join(dirpath, filename)
-                all_chunks.extend(get_chunks_for_file(file_path, chunk_cache, f"debug-dir-methods-only_{language}"))
-
-    if not all_chunks:
-        return []
-
-    chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
-    first_query = prepare_bm25_str(extracted_prefix + " " + extracted_suffix)
-    second_query = prepare_bm25_str(prefix + " " + suffix)
-
-    bm25 = BM25Okapi(chunk_texts)  # tokenized
-
-    first_scores = bm25.get_scores(first_query)
-    second_scores = bm25.get_scores(second_query)
-
-    first_top = sorted(range(len(first_scores)), key=lambda i: first_scores[i], reverse=True)[:top_k]
-    second_top = sorted(range(len(second_scores)), key=lambda i: second_scores[i], reverse=True)[:top_k]
-
-    # RRF fusion
-    combined_indices = reciprocal_rank_fusion([first_top, second_top])
-
-    # Deduplicate based on content hash, and return top_k
-    final_indices = []
-    seen_hashes = set()
-    for idx in combined_indices:
-        chunk_hash = hash(all_chunks[idx][1])
-        if chunk_hash not in seen_hashes:
-            seen_hashes.add(chunk_hash)
-            final_indices.append(idx)
-        if len(final_indices) >= top_k:
-            break
-
-    return [all_chunks[i] for i in reversed(final_indices)]
-
-def bm25_top_n_chunks_with_tokens(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 5) -> List[Tuple[str, str, int]]:
-    all_chunks = []
-    chunk_cache = {}
-
-    for dirpath, _, filenames in os.walk(root_dir):
-        for filename in filenames:
-            if filename.endswith(ext):
-                file_path = os.path.join(dirpath, filename)
-                chunks = get_chunks_for_file(file_path, chunk_cache)
-                all_chunks.extend(chunks)
-
-    chunk_texts = [prepare_bm25_str(chunk) for _, chunk in all_chunks]
-    query = prepare_bm25_str(prefix + " " + suffix)
-
-    if not chunk_texts:
-        return []
-
-    bm25 = BM25Okapi(chunk_texts)
-    scores = bm25.get_scores(query)
-    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-    reversed_top_indices = top_indices[::-1]
-    result = []
-    for idx in reversed_top_indices:
-        file_path, chunk = all_chunks[idx]
-        token_count = count_tokens(chunk)
-        result.append((file_path, chunk, token_count))
-
-    return result
-
-def bm25_top_n_chunks_with_missing_code_description(
-    root_dir: str,
-    bm25_middle_description: str,
-    ext: str,
-    top_k: int = 5
-) -> list[tuple[str, str]]:
+        :param root_dir: Root directory to search for source files.
+        :param bm25_middle_description: Query string used to score chunks with the BM25 algorithm.
+        :param ext: File extension filter (e.g., ".py", ".kt") to include relevant files only.
+        :param top_k: Number of top-ranked chunks to return (default: 5).
+        :return: List of (file_path, chunk_text) tuples for the top-ranked code chunks.
+        """
     all_chunks = []
     chunk_cache = {}
     for dirpath, _, filenames in os.walk(root_dir):
@@ -932,13 +549,21 @@ def bm25_top_n_chunks_with_missing_code_description(
     return [all_chunks[i] for i in reversed_top_indices]
 
 
-def bm25_chunks_within_limit_sorted_low_to_high(
-    root_dir: str,
-    prefix: str,
-    suffix: str,
-    ext: str,
-    context_limit: int = 8000
-) -> tuple[list[tuple[str, str]], int]:
+def bm25_chunks_within_limit_sorted_low_to_high(root_dir: str, prefix: str, suffix: str, ext: str, context_limit: int = 8000) -> tuple[list[tuple[str, str]], int]:
+    """
+            Retrieve BM25-ranked code chunks within a token budget,
+            sorted from lowest to highest BM25 relevance.
+
+            :param root_dir: Path to the root directory of the repository.
+            :param prefix: Code snippet preceding the masked code region.
+            :param suffix: Code snippet following the masked code region.
+            :param ext: File extension filter for selecting files.
+            :param context_limit: Maximum number of token.
+
+            :return: tuple[list[tuple[str, str]], int]:
+                    - List of (file_path, chunk) tuples representing the selected chunks.
+                    - total number of tokens used (including prefix, suffix, and chunks).
+            """
     all_chunks = []
     chunk_cache = {}
     for dirpath, _, filenames in os.walk(root_dir):
@@ -987,15 +612,25 @@ def bm25_chunks_within_limit_sorted_low_to_high(
     )
     return selected_chunks, total_tokens
 
-def bm25_chunks_above_percentile(
-    root_dir: str,
-    prefix: str,
-    suffix: str,
-    ext: str,
-    percentile: float = 90.0,
-    histogram_dir: str = None,
-    context_limit: int = 8000,
-) -> list[tuple[str, str]]:
+def bm25_chunks_above_percentile(root_dir: str, prefix: str, suffix: str, ext: str, percentile: float = 90.0, histogram_dir: str = None, context_limit: int = 8000) -> list[tuple[str, str]]:
+    """
+          Select code chunks above a BM25 score percentile threshold:
+              - Searches all files with the given extension in the repository.
+              - Splits files into code chunks and ranks them using BM25.
+              - Selects only chunks with scores at or above the specified percentile.
+              - Greedily adds top-ranked chunks until the context token limit is reached.
+
+          :param root_dir: Root directory of the repository to search.
+          :param prefix: Code snippet preceding the masked code region.
+          :param suffix: Code snippet following the masked code region.
+          :param ext: File extension filter (e.g., ".py", ".kt") for selecting files.
+          :param percentile: Percentile threshold for selecting top BM25-scored chunks.
+                             Defaults to 90.0.
+          :param context_limit: Maximum total token budget for selected chunks (including
+                                prefix and suffix). Defaults to 8000.
+          :return: A list of (file_path, chunk_content) tuples for chunks above the percentile
+                   threshold, sorted by BM25 relevance score (highest first).
+          """
     all_chunks = []
     chunk_cache = {}
     for dirpath, _, filenames in os.walk(root_dir):
@@ -1053,28 +688,128 @@ def bm25_chunks_above_percentile(
 
     return sorted(included_chunks, key=lambda x: scores[all_chunks.index(x)], reverse=True)
 
-def clean_json_string(response: str) -> str:
-    # Remove ```json or ``` if present
-    return re.sub(r"^```(?:json)?\s*|\s*```$", "", response.strip(), flags=re.IGNORECASE | re.MULTILINE)
+
+def assemble_context(top_chunks, file_descriptions, root_dir):
+    """
+        Assemble contextual snippets from top-ranked code chunks:
+            - Cleans up file paths relative to the project root
+            - Removes internal <think> annotations from file descriptions if any
+            - Formats each chunk with file metadata and separator symbols
+
+        :param top_chunks: List of tuples containing (file_path, chunk_content) for top-ranked chunks.
+        :param file_descriptions: Dictionary mapping file paths to their descriptive summaries.
+        :param root_dir: Root directory to trim from file paths for cleaner relative names.
+        :return: List of formatted context parts as strings, each including file info and code content.
+        """
+    context_parts = []
+    for file_path, chunk_content in top_chunks:
+        clean_file_name = file_path[len(root_dir) + 1:]
+        file_desc = re.sub(r'<think>.*?</think>', '', file_descriptions[file_path], flags=re.DOTALL).strip()
+
+        context_part = (
+            f"{FILE_SEP_SYMBOL}{clean_file_name}\n"
+            f"# This code snippet comes from this file: {clean_file_name},{file_desc}\n\n "
+            f"{chunk_content.strip()}\n"
+        )
+        context_parts.append(context_part)
+    return context_parts
 
 
-# llm as a judge
-MAX_TOKENS_QWEN = 16000
+def extract_first_json_object(text: str) -> str:
+    """Extracts the first JSON object from a string."""
+    brace_stack = []
+    start_index = None
 
-def bm25_llm_judge_rerank(
-    root_dir: str,
-    prefix: str,
-    suffix: str,
-    ext: str,
-    top_k: int = 10,
-    bm25_pool_size: int = 12
-) -> list[tuple[str, str]]:
+    for i, char in enumerate(text):
+        if char == '{':
+            if not brace_stack:
+                start_index = i
+            brace_stack.append(char)
+        elif char == '}':
+            if brace_stack:
+                brace_stack.pop()
+                if not brace_stack and start_index is not None:
+                    return text[start_index:i+1]
+    raise ValueError("No complete JSON object found in LLM response.")
+
+
+def rerank_with_llm_as_judge(chunks: list[tuple[str, str]], prefix: str, suffix: str, top_k: int, groq_client) -> list[tuple[str, str]]:
+    """
+       Re-rank code chunks using an LLM as the ranking judge:
+           - Formats candidate chunks into labeled snippets
+           - Constructs a prompt with the given prefix and suffix for context
+           - Sends the prompt to an LLM via the provided client for re-ranking
+           - Parses the LLM’s JSON response to determine chunk order
+           - Returns the top-N re-ranked chunks in reverse order
+
+       :param chunks: List of (file_path, chunk_text) tuples representing candidate code chunks.
+       :param prefix: Source code prefix used to provide left-hand context to the LLM.
+       :param suffix: Source code suffix used to provide right-hand context to the LLM.
+       :param top_k: Number of top re-ranked chunks to return.
+       :param groq_client: Client object used to send prompts and receive responses from the LLM.
+       :return: List of (file_path, chunk_text) tuples for the top-N re-ranked chunks.
+       """
+    formatted_snippets = []
+    for i, (_, chunk) in enumerate(chunks):
+        chunk_id = f"CHUNK_{i+1}"
+        formatted_snippets.append(f"{chunk_id}:\n{chunk.strip()}\n")
+
+    prompt = AGENT_RERANK_PROMPT_TEMPLATE.format(prefix, suffix, "\n".join(formatted_snippets))
+    response = groq_client.formatAndSend(prompt)
+
+    try:
+        json_str = extract_first_json_object(response)
+        parsed = json.loads(json_str)
+
+        chunk_id_map = {f"CHUNK_{i + 1}": chunk for i, chunk in enumerate(chunks)}  # 👈 Move here
+
+        print("\n [LLM RE-RANKING]:")
+        for i, chunk_id in enumerate(parsed.get("files", [])):
+            if chunk_id not in chunk_id_map:
+                continue
+            path, code = chunk_id_map[chunk_id]
+            first_line = code.strip().splitlines()[0] if code.strip() else "<empty>"
+            print(f"Rank {len(parsed['files']) - i}: {chunk_id} - {path}")
+            print(f"Code (first line): {first_line[:80]}")
+
+    except Exception as e:
+        raise ValueError(f"Failed to parse JSON from LLM response: {response}") from e
+
+    ordered_chunks = []
+    for chunk_id in parsed.get("files", []):
+        if chunk_id not in chunk_id_map:
+            print(f"[Warning] Unknown chunk ID returned by LLM: {chunk_id}")
+            continue
+        ordered_chunks.append(chunk_id_map[chunk_id])
+
+    return ordered_chunks[:top_k][::-1]  # From least to top best
+
+
+def bm25_llm_judge_rerank(root_dir: str, prefix: str, suffix: str, ext: str, top_k: int = 10, bm25_pool_size: int = 12) -> list[tuple[str, str]]:
+    """
+        Hybrid re-ranking of code chunks using BM25 and an LLM as judge:
+            - Walks the given directory to collect code chunks by extension
+            - Uses BM25 to retrieve the most relevant chunks based on extracted prefix/suffix context
+            - Selects a candidate pool of top-ranked chunks (bm25_pool_size)
+            - Ensures total tokens fit within the LLM’s context window by trimming excess chunks
+            - Sends candidates to an LLM judge for final re-ranking
+            - Returns the top-N re-ranked chunks
+
+        :param root_dir: Root directory to search for source files.
+        :param prefix: Source code prefix used as left-hand context around the caret position.
+        :param suffix: Source code suffix used as right-hand context around the caret position.
+        :param ext: File extension filter (e.g., ".py", ".kt") to include relevant files only.
+        :param top_k: Number of top re-ranked chunks to return (default: 10).
+        :param bm25_pool_size: Number of BM25-selected chunks to pass to the LLM for reranking (default: 12).
+        :return: List of (file_path, chunk_text) tuples representing the top-N re-ranked chunks.
+        """
+    MAX_TOKENS_QWEN = 16000
     code_bytes = (prefix + suffix).encode("utf-8")
     px_code_bytes = prefix.encode("utf-8")
     caret_offset = len(prefix.encode("utf-8"))
 
-    extracted_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
-    extracted_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
+    extracted_prefix = extract_prefix_nearest_block(px_code_bytes, caret_offset)
+    extracted_suffix = extract_suffix_nearest_block(code_bytes, caret_offset)
 
     all_chunks = []
     chunk_cache = {}
@@ -1097,7 +832,7 @@ def bm25_llm_judge_rerank(
     bm25_candidates = top_indices[:bm25_pool_size]
 
     print(root_dir)
-    print("\n🧠 [BM25 RANKING]:")
+    print("\n[BM25 RANKING]:")
     for rank, idx in enumerate(bm25_candidates):
         path, code = all_chunks[idx]
         chunk_id = f"CHUNK_{rank + 1}"
@@ -1127,107 +862,42 @@ def bm25_llm_judge_rerank(
     reranked = rerank_with_llm_as_judge(candidate_chunks, prefix, suffix, top_k, groq_client)
     return reranked
 
-
-
-def find_random_recent_file(root_dir: str, recent_filenames: list[str], min_lines: int = 10) -> str:
-    """
-    Select the most recent file:
-        - in the given language
-        - in the given directory and its subdirectories
-        - meeting length requirements
-
-    :param root_dir: Directory to search for files.
-    :param recent_filenames: List of recent files filenames.
-    :param min_lines: Minimum number of lines required in the file.
-    :return: Selected random file or None if no files were found.
-    """
-    code_files = []
-    for filename in recent_filenames:
-        if filename.endswith(extension):
-            file_path = os.path.join(root_dir, filename)
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-                    if len(lines) >= min_lines:
-                        code_files.append(file_path)
-            except Exception as e:
-                # Optional: handle unreadable files
-                # print(f"Could not read {file_path}: {e}")
-                pass
-    return random.choice(code_files) if code_files else None
-
 def trim_prefix(prefix: str):
+    """
+           Extract a trimmed and focused code prefix based on language-specific block boundaries:
+               - Determines the caret position based on the length of the prefix.
+               - Uses language-specific functions to extract the closest enclosing block
+
+           :param prefix: Code snippet preceding the masked code region.
+           :return: Trimmed prefix string extracted from the nearest logical code block.
+           """
     global updated_prefix
     code_bytes = (prefix + suffix).encode("utf-8")
     px_code_bytes = prefix.encode("utf-8")
     caret_offset = len(prefix.encode("utf-8"))
     if language == "python":
-        updated_prefix = extract_prefix_from_last_block(px_code_bytes, caret_offset)
+        updated_prefix = extract_prefix_nearest_block(px_code_bytes, caret_offset)
     elif language == "kotlin":
-        updated_prefix = extract_prefix_from_last_block_kt(code_bytes, caret_offset)
+        updated_prefix = extract_prefix_nearest_block_kt(code_bytes, caret_offset)
     return updated_prefix
 
 def trim_suffix(suffix: str):
+    """
+            Extract a trimmed and focused code suffix based on language-specific block boundaries:
+                - Determines the caret position based on the prefix length.
+                - Uses language-specific functions to extract the next enclosing block
+
+            :param suffix: Code snippet following the masked code region.
+            :return: Trimmed suffix string extracted from the nearest logical code block.
+            """
     global  updated_suffix
     code_bytes = (prefix + suffix).encode("utf-8")
     caret_offset = len(prefix.encode("utf-8"))
     if language == "python":
-        updated_suffix = extract_suffix_to_next_block(code_bytes, caret_offset)
+        updated_suffix = extract_suffix_nearest_block(code_bytes, caret_offset)
     elif language == "kotlin":
-        updated_suffix = extract_suffix_to_next_block_kt(code_bytes, caret_offset)
+        updated_suffix = extract_suffix_nearest_block_kt(code_bytes, caret_offset)
     return updated_suffix
-
-
-def log_token_usage(token_log_path: str, instance_id: int, files: List[str], token_count: int, prefix_suffix_tokens: int):
-    file_list = ", ".join(files)
-    file_exists = os.path.isfile(token_log_path)
-    with open(token_log_path, 'a', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['Instance', 'Files', 'PrefixSuffixTokens', 'TotalTokens']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow({
-            'Instance': instance_id,
-            'Files': file_list,
-            'PrefixSuffixTokens': prefix_suffix_tokens,
-            'TotalTokens': token_count
-        })
-
-def plot_token_usage_chart(token_log_path: str):
-    instances = []
-    total_tokens = []
-    prefix_suffix_tokens = []
-
-    with open(token_log_path, 'r', encoding='utf-8') as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            instances.append(int(row['Instance']))
-            total = int(row['TotalTokens'])
-            prefix_suffix = int(row['PrefixSuffixTokens'])
-            total_tokens.append(total)
-            prefix_suffix_tokens.append(prefix_suffix)
-
-    # Compute chunk tokens (i.e., total - prefix+suffix)
-    chunk_tokens = [total - prefix for total, prefix in zip(total_tokens, prefix_suffix_tokens)]
-
-    plt.figure(figsize=(14, 6))
-    bar1 = plt.bar(instances, prefix_suffix_tokens, color='#6baed6', label='Prefix + Suffix')
-    bar2 = plt.bar(instances, chunk_tokens, bottom=prefix_suffix_tokens, color='orange', label='Context Chunks')
-
-    plt.axhline(8000, color='orange', linestyle='--', label='8K Token Limit')
-    plt.axhline(16000, color='red', linestyle='--', label='16K Token Limit')
-    plt.xlabel("Code Completion Instance")
-    plt.ylabel("Total Token Count")
-    plt.title("Token Length per Code Completion Context")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("predictions/token_chart.png")
-    plt.show()
-
-
-
-# Define the log path
-token_log_path = os.path.join("predictions", f"{language}-{stage}-{strategy}_token_usage.csv")
 
 # Path to the file with completion points
 completion_points_file = os.path.join("data", f"{language}-{stage}.jsonl")
@@ -1252,8 +922,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             prefix = datapoint["prefix"]
             suffix = datapoint["suffix"]
             selected_files = []
-            # Compose the full context with file separators
-            used_tokens = 0
             context_parts = []
 
             # Run the strategy
@@ -1261,8 +929,8 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 selected_files = [find_random_file(root_directory)]
             elif strategy == "bm25":
                 selected_files = [find_bm25_file(root_directory, datapoint['prefix'], datapoint['suffix'])]
-            elif strategy == "bm25_top_4_files":
-                selected_files = find_bm25_top_3_files(root_directory, datapoint['prefix'], datapoint['suffix'])
+            elif strategy == "bm25_top_3_files":
+                selected_files = find_bm25_top_n_files(root_directory, datapoint['prefix'], datapoint['suffix'])
             elif strategy == "bm25_top_5_chunks_methods_only_with_desc":
                 top_chunks= bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
                 selected_files = [file_path for file_path, _ in top_chunks]
@@ -1271,17 +939,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
                                                               file_content=chunk_content)
                     context_parts.append(context_part)
-                    used_tokens += count_tokens(context_part)
-                total_tokens_used = used_tokens
-                output_file = f"debug-chunk-methods/top_chunks_{language}_{repo_id}.txt"
-                with open(output_file, "w", encoding="utf-8") as f:
-                        f.write(f"# Root Directory: {root_directory}\n\n")
-                        for file_path, chunk_content in top_chunks:
-                            clean_file_name = file_path[len(root_directory) + 1:]
-                            header = f"## File: {clean_file_name}\n"
-                            f.write(header)
-                            f.write(chunk_content)
-                            f.write("\n\n")  # Separate chunks clearly
             elif strategy == "bm25_top_5_2k_8_chunks_methods_only_trimmed_query_px_and_sx":
                 top_chunks = bm25_top_n_chunks_trimmed_px_sx(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
                 selected_files = [file_path for file_path, _ in top_chunks]
@@ -1290,17 +947,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
                                                               file_content=chunk_content)
                     context_parts.append(context_part)
-                    used_tokens += count_tokens(context_part)
-                total_tokens_used = used_tokens
-                output_file = f"debug-chunk-methods/top_chunks_{language}_{repo_id}.txt"
-                with open(output_file, "w", encoding="utf-8") as f:
-                    f.write(f"# Root Directory: {root_directory}\n\n")
-                    for file_path, chunk_content in top_chunks:
-                        clean_file_name = file_path[len(root_directory) + 1:]
-                        header = f"## File: {clean_file_name}\n"
-                        f.write(header)
-                        f.write(chunk_content)
-                        f.write("\n\n")  # Separate chunks clearly
             elif strategy == "llm_as_judge_top_10_chunks_methods_trimmed_query_prefix_and_suffix":
                 top_chunks = bm25_llm_judge_rerank(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
                 selected_files = [file_path for file_path, _ in top_chunks]
@@ -1309,97 +955,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
                                                               file_content=chunk_content)
                     context_parts.append(context_part)
-                    used_tokens += count_tokens(context_part)
-                total_tokens_used = used_tokens
-                output_file = f"debug-chunk-methods/top_chunks_{language}_{repo_id}.txt"
-                with open(output_file, "w", encoding="utf-8") as f:
-                    f.write(f"# Root Directory: {root_directory}\n\n")
-                    for file_path, chunk_content in top_chunks:
-                        clean_file_name = file_path[len(root_directory) + 1:]
-                        header = f"## File: {clean_file_name}\n"
-                        f.write(header)
-                        f.write(chunk_content)
-                        f.write("\n\n")  # Separate chunks clearly
-            elif strategy == "embed_chunks_method_lvl_top_10":
-                top5 = embedding_get_top_k_chunks(root_directory, datapoint['prefix'], datapoint['suffix'],
-                                                  extension)
-
-                for file_path, chunk_content, score in tqdm(top5, desc="Building context from top chunks"):
-                    clean_file_name = file_path[len(root_directory) + 1:]
-                    context_part = FILE_COMPOSE_FORMAT.format(
-                        file_sep=FILE_SEP_SYMBOL,
-                        file_name=clean_file_name,  # Fixed: `clean_name` → `clean_file_name`
-                        file_content=chunk_content
-                    )
-                    context_parts.append(context_part)
-                    used_tokens += count_tokens(context_part)
-
-                total_tokens_used = used_tokens
-            elif strategy == "nv_embed_chunks_top_5":
-                top5 = embedding_get_top_k_chunks_nv(root_directory, datapoint['prefix'], datapoint['suffix'],
-                                                  extension)
-                merged_top5 = ast_merge_chunks_per_file(top5, lang="python")
-                for file_path, chunk_content, score in tqdm(merged_top5, desc="Building context from top chunks"):
-                    clean_file_name = file_path[len(root_directory) + 1:]
-                    context_part = FILE_COMPOSE_FORMAT.format(
-                        file_sep=FILE_SEP_SYMBOL,
-                        file_name=clean_file_name,  # Fixed: `clean_name` → `clean_file_name`
-                        file_content=chunk_content
-                    )
-                    context_parts.append(context_part)
-                    used_tokens += count_tokens(context_part)
-
-                total_tokens_used = used_tokens
-            elif strategy == "bm25_chunks_text_info_mid_hint_no_other_context":
-                # STEP 1: Get original prefix/suffix
-                original_prefix = datapoint["prefix"]
-                original_suffix = datapoint["suffix"]
-
-                # STEP 2: Query LLM for a description
-                fill_prompt = f"""{SYSTEM_INSTRUCTION_MID}
-
-                --- BEGIN PREFIX ---
-                {original_prefix}
-                --- END PREFIX ---
-
-                --- BEGIN SUFFIX ---
-                {original_suffix}
-                --- END SUFFIX ---
-
-                """
-
-                try:
-                    middle_description = llm.invoke(fill_prompt).strip()
-                    # Clean up stray outer quotes if present
-                    if middle_description.startswith('"') and middle_description.endswith('"'):
-                        middle_description = middle_description[1:-1]
-
-                except Exception as e:
-                    print(f"LLM failed for instance {instance_id}: {e}")
-                    middle_description = "[LLM Description Unavailable]"
-                middle_description = re.sub(r'<think>.*?</think>', '', middle_description, flags=re.DOTALL).strip()
-                description_record = {
-                    "instance_id": instance_id,
-                    "repo": datapoint["repo"],
-                    "description": middle_description
-                }
-                with jsonlines.open(descriptions_log_path, 'a') as descriptions_writer:
-                    descriptions_writer.write(description_record)
-                description_comment = "\n".join(f"# {line}" for line in middle_description.splitlines())
-
-                # STEP 3: Prepend to prefix
-                prefix = f"Hint: The missing part might; {description_comment}\n\n{original_prefix}"
-                suffix = original_suffix
-
-                top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
-                selected_files = [file_path for file_path, _ in top_chunks]
-                for file_path, chunk_content in top_chunks:
-                    clean_file_name = file_path[len(root_directory) + 1:]
-                    context_part = ""
-                    context_parts.append(context_part)
-                    used_tokens += count_tokens(context_part)
-                total_tokens_used = used_tokens
-            elif strategy == "bm25_chunks_mid_desc_bm25_query":
+            elif strategy == "bm25_chunks_middle_code_desc_as_bm25_query":
                 # STEP 1: Get original prefix/suffix
                 original_prefix = datapoint["prefix"]
                 original_suffix = datapoint["suffix"]
@@ -1433,15 +989,13 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
                                                               file_content=chunk_content)
                     context_parts.append(context_part)
-                    used_tokens += count_tokens(context_part)
-                total_tokens_used = used_tokens
             elif strategy == "bm25_top_5_chunks_target_file_text_info":
                 # STEP 1: Get original prefix/suffix
                 original_prefix = datapoint["prefix"]
                 original_suffix = datapoint["suffix"]
 
                 # STEP 2: Query LLM for a description
-                fill_prompt = f"""{SYSTEM_INSTRUCTION_W_TARGET_FILE}
+                fill_prompt = f"""{SYSTEM_INSTRUCTION_FOR_TARGET_FILE}
 
                                 --- BEGIN PREFIX ---
                                 {original_prefix}
@@ -1450,9 +1004,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                                 --- BEGIN SUFFIX ---
                                 {original_suffix}
                                 --- END SUFFIX ---
-
                                 """
-
                 try:
                     file_description = llm.invoke(fill_prompt).strip()
                 except Exception as e:
@@ -1478,125 +1030,13 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
                                                            file_content=chunk_content)
                     context_parts.append(context_part)
-                    used_tokens += count_tokens(context_part)
-                total_tokens_used = used_tokens
-            elif strategy == "bm25_chunks_text_info_hint":
-                # STEP 1: Get original prefix/suffix
-                original_prefix = datapoint["prefix"]
-                original_suffix = datapoint["suffix"]
-
-                # STEP 2: Query LLM for a description
-                fill_prompt = f"""{SYSTEM_INSTRUCTION_MID}
-
-                --- BEGIN PREFIX ---
-                {original_prefix}
-                --- END PREFIX ---
-
-                --- BEGIN SUFFIX ---
-                {original_suffix}
-                --- END SUFFIX ---
-
-                """
-
-                try:
-                    middle_description = llm.invoke(fill_prompt).strip()
-                    # Clean up stray outer quotes if present
-                    if middle_description.startswith('"') and middle_description.endswith('"'):
-                        middle_description = middle_description[1:-1]
-
-                except Exception as e:
-                    print(f"LLM failed for instance {instance_id}: {e}")
-                    middle_description = "[LLM Description Unavailable]"
-                middle_description = re.sub(r'<think>.*?</think>', '', middle_description, flags=re.DOTALL).strip()
-                description_record = {
-                    "instance_id": instance_id,
-                    "repo": datapoint["repo"],
-                    "description": middle_description
-                }
-                with jsonlines.open(descriptions_log_path, 'a') as descriptions_writer:
-                    descriptions_writer.write(description_record)
-                description_comment = "\n".join(f"# {line}" for line in middle_description.splitlines())
-
-                # STEP 3: Prepend to prefix
-                prefix = f"{description_comment}\n\n{original_prefix}"
-                suffix = original_suffix
-
-                top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
-                selected_files = [file_path for file_path, _ in top_chunks]
-                for file_path, chunk_content in top_chunks:
-                    clean_file_name = file_path[len(root_directory) + 1:]
-                    context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
-                                                              file_content=chunk_content)
-                    context_parts.append(context_part)
-                    used_tokens += count_tokens(context_part)
-                total_tokens_used = used_tokens
-            elif strategy == "bm25_chunks_target_file_and_mis_code_text_info":
-                # STEP 1: Get original prefix/suffix
-                original_prefix = datapoint["prefix"]
-                original_suffix = datapoint["suffix"]
-
-                # STEP 2: Query LLM for a description
-                target_file_prompt = f"""{SYSTEM_INSTRUCTION_W_TARGET_FILE}
-
-                                --- BEGIN PREFIX ---
-                                {original_prefix}
-                                --- END PREFIX ---
-
-                                --- BEGIN SUFFIX ---
-                                {original_suffix}
-                                --- END SUFFIX ---
-
-                                """
-                mis_code_prompt = f"""{SYSTEM_INSTRUCTION_MID}
-
-                                --- BEGIN PREFIX ---
-                                {original_prefix}
-                                --- END PREFIX ---
-
-                                --- BEGIN SUFFIX ---
-                                {original_suffix}
-                                --- END SUFFIX ---
-
-                                """
-                try:
-                    file_description = llm.invoke(target_file_prompt).strip()
-                    mis_code_description = llm.invoke(mis_code_prompt).strip()
-                except Exception as e:
-                    print(f"LLM failed for instance {instance_id}: {e}")
-                    file_description = "[LLM Description Unavailable]"
-                    mis_code_description = "[LLM Description Unavailable]"
-                file_description = re.sub(r'<think>.*?</think>', '', file_description, flags=re.DOTALL).strip()
-                mis_code_description = re.sub(r'<think>.*?</think>', '', mis_code_description, flags=re.DOTALL).strip()
-                description_record = {
-                    "instance_id": instance_id,
-                    "repo": datapoint["repo"],
-                    "file_description": file_description,
-                    "mis_code_description": mis_code_description
-                }
-                with jsonlines.open(descriptions_log_path, 'a') as descriptions_writer:
-                    descriptions_writer.write(description_record)
-                file_description_comment = "\n".join(f"# {line}" for line in file_description.splitlines())
-                mis_code_description_comment = "\n".join(f"# {line}" for line in mis_code_description.splitlines())
-                # STEP 3: Prepend to prefix
-                prefix = f"{file_description_comment}\n\n{mis_code_description_comment}\n\n{original_prefix}"
-                suffix = f"{original_suffix}"
-                top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'], extension)
-                selected_files = [file_path for file_path, _ in top_chunks]
-                for file_path, chunk_content in top_chunks:
-                    clean_file_name = file_path[len(root_directory) + 1:]
-                    context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
-
-                                                           file_content=chunk_content)
-                    context_parts.append(context_part)
-                    used_tokens += count_tokens(context_part)
-                total_tokens_used = used_tokens
             elif strategy == "bm25_chunks_text_info_px_sx":
                 # STEP 1: Get original prefix/suffix
                 original_prefix = datapoint["prefix"]
                 original_suffix = datapoint["suffix"]
 
                 # STEP 2: Query LLM for a description
-                fill_prompt = f"""{SYSTEM_INSTRUCTION_MID}
+                fill_prompt = f"""{SYSTEM_INSTRUCTION_MISSING_CODE}
 
                 --- BEGIN PREFIX ---
                 {original_prefix}
@@ -1626,17 +1066,14 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
                 try:
                     prefix_description = llm.invoke(prefix_prompt).strip()
-                    #middle_description = llm.invoke(fill_prompt).strip()
                     suffix_description = llm.invoke(suffix_prompt).strip()
 
 
                 except Exception as e:
                     print(f"LLM failed for instance {instance_id}: {e}")
-                    middle_description = "[LLM Description Unavailable]"
                     prefix_description = "[LLM Description Unavailable]"
                     suffix_description = "[LLM Description Unavailable]"
                 prefix_description = re.sub(r'<think>.*?</think>', '', prefix_description, flags=re.DOTALL).strip()
-                #middle_description = re.sub(r'<think>.*?</think>', '', middle_description, flags=re.DOTALL).strip()
                 suffix_description = re.sub(r'<think>.*?</think>', '', suffix_description, flags=re.DOTALL).strip()
                 description_record = {
                     "instance_id": instance_id,
@@ -1647,7 +1084,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 with jsonlines.open(descriptions_log_path, 'a') as descriptions_writer:
                     descriptions_writer.write(description_record)
                 px_description_comment = "\n".join(f"# {line}" for line in prefix_description.splitlines())
-                #mid_description_comment = "\n".join(f"# {line}" for line in middle_description.splitlines())
                 sx_description_comment = "\n".join(f"# {line}" for line in suffix_description.splitlines())
 
                 # STEP 3: Prepend to prefix
@@ -1661,24 +1097,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                     context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
                                                               file_content=chunk_content)
                     context_parts.append(context_part)
-                    used_tokens += count_tokens(context_part)
-                total_tokens_used = used_tokens
-            elif strategy == "bm25_chunks_limited_8k":
-                    description_cache = {}
-                    top_chunks, total_tokens_used = bm25_chunks_within_limit_sorted_low_to_high(
-                        root_directory, datapoint['prefix'], datapoint['suffix'], extension
-                    )
-                    # Only generate descriptions for files relevant to top_chunks
-                    file_descriptions = describe_files_for_top_chunks(top_chunks, description_cache)
-
-                    # Assemble the context with file-level descriptions
-                    context_parts = assemble_context(top_chunks, file_descriptions, root_directory)
-                    used_tokens = 0
-                    for part in context_parts:
-                        print(part)
-                        used_tokens += count_tokens(part)
-
-                    total_tokens_used = used_tokens
             elif strategy == "bm25_top_5_chunks_attached_with_file_desc_refined_prompt":
                 description_cache = {}
                 top_chunks = bm25_top_n_chunks(root_directory, datapoint['prefix'], datapoint['suffix'],
@@ -1689,14 +1107,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
                 # Assemble the context with file-level descriptions
                 context_parts = assemble_context(top_chunks, file_descriptions, root_directory)
-
-                used_tokens = 0
-                for part in context_parts:
-                    print(part)
-                    used_tokens += count_tokens(part)
-
-                total_tokens_used = used_tokens
-
             elif strategy == "bm25_iterative_rag_5_chunks_code_as_context":
                 # Step 1: Initial retrieval
                 initial_chunks = bm25_top_n_chunks(root_directory, prefix, suffix, extension)
@@ -1710,7 +1120,7 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                         file_content=chunk
                     )
 
-                # Step 2: Generate rough middle code (improved prompt formatting)
+                # Step 2: Generate rough middle code
                 bootstrap_prompt = f"""{SYSTEM_INSTRUCTION_CODE_GEN}
 
                 # === [EXAMPLE COMPLETION] ===
@@ -1787,25 +1197,8 @@ with jsonlines.open(completion_points_file, 'r') as reader:
 
                 # Add to context
                 context_parts.append(refined_context)
-                used_tokens += count_tokens(refined_context)
-                total_tokens_used = used_tokens
-                debug_dir = "iterative_rag_debug_dir_5_chunks_potential_code_as_2_context"
-                # Optional Debug Dump
-                if debug_dir:
-                    os.makedirs(debug_dir, exist_ok=True)
-                    with open(os.path.join(debug_dir, f"{instance_id}_initial_context.txt"), 'w',
-                              encoding='utf-8') as f:
-                        f.write(initial_context)
-                    with open(os.path.join(debug_dir, f"{instance_id}_bootstrap_middle.txt"), 'w',
-                              encoding='utf-8') as f:
-                        f.write(bootstrap_middle)
-                    with open(os.path.join(debug_dir, f"{instance_id}_refined_context.txt"), 'w',
-                              encoding='utf-8') as f:
-                        f.write(refined_context)
-
             elif strategy == "bm25_chunks_above_percentile":
                 threshold_percentile = 98.5
-                #histogram_output_dir = "bm25_histograms_practice_percentile_1.5"
 
                 top_chunks = bm25_chunks_above_percentile(
                     root_dir=root_directory,
@@ -1823,20 +1216,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                         file_content=chunk_content
                     )
                     context_parts.append(context_part)
-                    used_tokens += count_tokens(context_part)
-                total_tokens_used = used_tokens
-            elif strategy == "coderank_embed_chunks_top_5":
-                print("coderank_embed_chunks_top_5")
-                top5 = embedding_get_top_k_chunks_coderank(root_directory, datapoint['prefix'], datapoint['suffix'],
-                                                           extension)
-                merged_top5 = ast_merge_chunks_per_file(top5, lang=language)  # optional, you already have this
-                for file_path, chunk_content, score in tqdm(merged_top5, desc="Building context from top chunks"):
-                    clean_file_name = file_path[len(root_directory) + 1:]
-                    context_part = FILE_COMPOSE_FORMAT.format(file_sep=FILE_SEP_SYMBOL, file_name=clean_file_name,
-                                                              file_content=chunk_content)
-                    context_parts.append(context_part)
-                    used_tokens += count_tokens(context_part)
-                total_tokens_used = used_tokens
             elif strategy == "recent":
                 recent_filenames = datapoint['modified']
                 file = find_random_recent_file(root_directory, recent_filenames)
@@ -1844,9 +1223,8 @@ with jsonlines.open(completion_points_file, 'r') as reader:
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
 
-            if strategy not in [ "bm25_top_5_2k_8_chunks_methods_only_trimmed_query_px_and_sx", "bm25_chunks_text_info_hint", "bm25_chunks_limited_8k", "bm25_chunks_above_percentile", "bm25_top_5_chunks_target_file_text_info", "bm25_chunks_text_info_px_sx", "bm25_chunks_text_info_mid_hint_no_other_context"
-                                , "bm25_top_5_chunks_attached_with_file_desc_refined_prompt", "bm25_chunks_target_file_and_mis_code_text_info",  "bm25_top_5_chunks_methods_only_with_desc", "bm25_iterative_rag_5_chunks_code_as_context", "bm25_top_5_chunks_method_lvl_trimmed_query_prefix_and_suffix_2_ranks",
-                                 "bm25_top_5_chunks_min2k_trimmed_query_prefix_and_suffix", "llm_as_judge_top_10_chunks_methods_trimmed_query_prefix_and_suffix", "bm25_top_6_chunks_trimmed_query_prefix_and_suffix", "embed_chunks_method_lvl_top_10", "nv_embed_chunks_top_5", "coderank_embed_chunks_top_5"]:
+            # add all strategies involving chunks to the list
+            if strategy not in [ "bm25_top_5_2k_8_chunks_methods_only_trimmed_query_px_and_sx"]:
                 for file_path in selected_files:
                     if not file_path:
                         continue
@@ -1860,7 +1238,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                             file_content=file_content
                         )
                         context_parts.append(context_part)
-                        used_tokens += count_tokens(context_part)
                     except Exception as e:
                         print(f"Skipping file {file_path} due to error: {e}")
                         continue
@@ -1877,18 +1254,6 @@ with jsonlines.open(completion_points_file, 'r') as reader:
                 submission["prefix"] = trim_prefix(datapoint["prefix"])
             if args.trim_suffix:
                 submission["suffix"] = trim_suffix(datapoint["suffix"])
-
-            # print(f"Picked files: {[os.path.basename(f) for f in selected_files if f]}")
-            # print(f"Total tokens: {used_tokens}")
             writer.write(submission)
 
-            prefix_suffix_tokens = count_tokens(prefix) + count_tokens(suffix)
 
-            log_token_usage(
-                token_log_path=token_log_path,
-                instance_id=instance_id,
-                files=[os.path.basename(f) for f in selected_files if f],
-                token_count=total_tokens_used,
-                prefix_suffix_tokens=prefix_suffix_tokens
-            )
-        plot_token_usage_chart(token_log_path)

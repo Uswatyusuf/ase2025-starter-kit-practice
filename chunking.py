@@ -2,98 +2,16 @@ from tree_sitter import Language,Parser
 import tree_sitter_python as tspython
 import tree_sitter_kotlin as ts_kotlin
 from transformers import AutoTokenizer
-from langchain_ollama import OllamaLLM
-import re
-import ollama
 
 
-
-file_path = "data/repositories-python-public/blankly-finance__blankly-4540939864aa9ef867ed514881d431a374d12808/Blankly/blankly_bot.py"
 mellum_tokenizer = AutoTokenizer.from_pretrained("JetBrains/Mellum-4b-sft-python")
-#tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
-MAX_TOKENS = 512
 
-llm = OllamaLLM(model="qwen3:8b", temperature=0)
 
-SYSTEM_INSTRUCTION_METHOD_DESC = """You are an experienced software engineer.
 
-Below, you are given two partial code fragments: a PREFIX and a SUFFIX from the same source file. Together, these represent parts of a larger file.
 
-Please write a brief, high-level description of the **purpose** of this file, based on the given code. Focus on describing what the file is supposed to do overall (its main functionality or role in the project).
-
-Keep your description short and clear (ideally 1-3 sentences).
-
-"""
-
-# Read the actual file content
-with open(file_path, 'r', encoding='utf-8') as f:
-    code = f.read()
 
 PY_LANGUAGE = Language(tspython.language())
 KT_LANGUAGE = Language (ts_kotlin.language())
-
-# def cast_chunk_code(code: str, max_chunk_size: int = 1000) -> list[str]:
-#     PY_LANGUAGE = Language(tspython.language())
-#     parser = Parser(PY_LANGUAGE)
-#
-#
-#     tree = parser.parse(code.encode("utf-8"))
-#     root = tree.root_node
-#     code_bytes = code.encode("utf-8")
-#
-#     def get_node_size(node):
-#         return len(code_bytes[node.start_byte:node.end_byte].replace(b" ", b"").replace(b"\n", b""))
-#
-#     def chunk_ast_nodes(nodes):
-#         chunks = []
-#         chunk = []
-#         size = 0
-#
-#         for node in nodes:
-#             node_size = get_node_size(node)
-#             if node_size > max_chunk_size:
-#                 if chunk:
-#                     chunks.append(chunk)
-#                     chunk = []
-#                     size = 0
-#                 subchunks = chunk_ast_nodes(node.children)
-#                 chunks.extend(subchunks)
-#             elif size + node_size > max_chunk_size:
-#                 chunks.append(chunk)
-#                 chunk = [node]
-#                 size = node_size
-#             else:
-#                 chunk.append(node)
-#                 size += node_size
-#
-#         if chunk:
-#             chunks.append(chunk)
-#         return chunks
-#
-#     ast_chunks = chunk_ast_nodes(root.children)
-#     return [
-#         "".join([code_bytes[n.start_byte:n.end_byte].decode("utf-8") for n in chunk])
-#         for chunk in ast_chunks
-#     ]
-
-def summarize_class_with_qwen(class_code: str) -> str:
-    """Ask Qwen to summarize the purpose of a class with no reasoning."""
-    prompt = f"""
-You are an assistant that summarizes Python classes literally.
-Do not infer any purpose not explicitly shown in code.
-
-Class:
-\"\"\"
-{class_code}
-\"\"\"
-
-Give a one-sentence summary of what this class does. Do not explain or reason.
-"""
-    response = ollama.chat(
-        model='qwen3:8b',
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return re.sub(r'<think>.*?</think>', '', response['message']['content'], flags=re.DOTALL).strip()
 
 
 def chunk_class_methods_with_desc(node, code_bytes, max_tokens, class_purpose):
@@ -145,6 +63,17 @@ def chunk_class_methods_with_desc(node, code_bytes, max_tokens, class_purpose):
 
 
 def basic_ast_chunk_code(code: str) -> list[str]:
+    """
+       Split Python source code into chunks using a Tree-sitter AST:
+           - Parses the given code into an abstract syntax tree
+           - Groups consecutive expression statements together
+           - Treats other top-level nodes (functions, classes, etc.) as separate chunks
+           - Skips import statements to reduce noise
+           - Returns a list of code snippets preserving original formatting
+
+       :param code: Python source code as a string.
+       :return: List of code chunks extracted from the AST, each as a string.
+       """
     PY_LANGUAGE = Language(tspython.language())
     parser = Parser(PY_LANGUAGE)
     code_bytes = code.encode("utf-8")
@@ -180,15 +109,22 @@ def basic_ast_chunk_code(code: str) -> list[str]:
     flush_expr_group()
     return chunks
 
-
-
 def basic_ast_chunk_code_methods_only(code: str, lang: str) -> list[str]:
+    """
+        Split source code into chunks containing only methods and functions:
+            - Parses the given code into an AST using Tree-sitter
+            - Preserves top-level imports to include in each extracted chunk
+            - Extracts functions and class methods, including decorators
+            - For classes, generates a class header and groups decorators with each method
+            - Returns a list of method-level code chunks as strings
+
+        :param code: Source code as a string.
+        :param lang: Programming language name (currently only "python" is supported).
+        :return: List of code chunks, each representing a function or method with relevant context.
+        """
     global parser
     if lang.lower() == "python":
         parser = Parser(PY_LANGUAGE)
-    elif lang.lower() == "kotlin":
-        parser = Parser(KT_LANGUAGE)
-
     code_bytes = code.encode("utf-8")
     tree = parser.parse(code_bytes)
     root = tree.root_node
@@ -224,13 +160,13 @@ def basic_ast_chunk_code_methods_only(code: str, lang: str) -> list[str]:
                 )
                 chunks.append(full_chunk)
 
-    # 1. Collect top-level imports
+    # Collect top-level imports
     local_imports = []
     for node in root.children:
         if node.type in {"import_statement", "import_from_statement", "future_import_statement"}:
             local_imports.append(extract_node_text(node).strip())
 
-    # 2. Re-process and extract method/function/class chunks
+    # Re-process and extract method/function/class chunks
     for node in root.children:
         if node.type in {"import_statement", "import_from_statement", "future_import_statement"}:
             continue
@@ -263,26 +199,6 @@ def basic_ast_chunk_code_methods_only(code: str, lang: str) -> list[str]:
 
     return chunks
 
-
-
-def print_ast_structure(code: str):
-    PY_LANGUAGE = Language(tspython.language())
-    parser = Parser(PY_LANGUAGE)
-    code_bytes = code.encode("utf-8")
-    tree = parser.parse(code_bytes)
-    root = tree.root_node
-
-    print("Root type:", root.type)
-
-    for i, node in enumerate(root.children):
-        node_type = node.type
-        node_text = code_bytes[node.start_byte:node.end_byte].decode("utf-8").strip()
-        print(f"--- Node {i+1} ---")
-        print(f"Type: {node_type}")
-        print(f"Text:\n{node_text}")
-        print()
-
-
 def token_count(text: str) -> int:
     return len(mellum_tokenizer.encode(text, add_special_tokens=False))
 
@@ -312,7 +228,18 @@ def extract_class_header(node, code_bytes) -> str:
     return header
 
 
-def chunk_kotlin_with_full_context(code: str) -> list[str]:
+def chunk_kotlin_method_lvl_full_context(code: str) -> list[str]:
+    """
+        Split Kotlin source code into function-level chunks with full context:
+            - Parses the code into an AST using Tree-sitter
+            - Extracts function declarations along with their annotations and modifiers
+            - Collects surrounding class, object, interface, or companion object context
+            - Preserves documentation comments (KDoc) above functions or parent declarations
+            - Returns function-level chunks enriched with their enclosing context
+
+        :param code: Kotlin source code as a string.
+        :return: List of code chunks, each containing a function with annotations and parent context.
+        """
     parser = Parser(KT_LANGUAGE)
     code_bytes = code.encode("utf-8")
     tree = parser.parse(code_bytes)
@@ -350,12 +277,7 @@ def chunk_kotlin_with_full_context(code: str) -> list[str]:
             parent = parent.parent
         return context
 
-    def get_package_and_imports():
-        headers = []
-        for node in root.children:
-            if node.type in {"package_header", "import_list", "import_header", "import_statement"}:
-                headers.append(extract_text(node).strip())
-        return headers
+
 
     def process_function(node):
         if node.type != "function_declaration":
@@ -373,91 +295,5 @@ def chunk_kotlin_with_full_context(code: str) -> list[str]:
             walk(child)
 
     walk(root)
-    return chunks
-
-def basic_ast_chunk_code_methods_only_with_desc(code: str, lang: str) -> list[str]:
-    if lang.lower() == "python":
-        parser = Parser(PY_LANGUAGE)
-    elif lang.lower() == "kotlin":
-        parser = Parser(KT_LANGUAGE)
-    else:
-        raise ValueError("Unsupported language")
-
-    code_bytes = code.encode("utf-8")
-    tree = parser.parse(code_bytes)
-    root = tree.root_node
-    chunks = []
-
-    def extract_node_text(node):
-        return code_bytes[node.start_byte:node.end_byte].decode("utf-8")
-
-    def extract_decorators_above(node):
-        decorators = []
-        sibling = node.prev_sibling
-        while sibling and sibling.type == "decorator":
-            decorators.insert(0, extract_node_text(sibling).rstrip())
-            sibling = sibling.prev_sibling
-        return decorators
-
-    def extract_class_name(class_node):
-        name_node = class_node.child_by_field_name("name")
-        return extract_node_text(name_node) if name_node else "UnknownClass"
-
-    # 1. Extract top-level imports
-    local_imports = []
-    for node in root.children:
-        if node.type in {"import_statement", "import_from_statement", "future_import_statement"}:
-            local_imports.append(extract_node_text(node).strip())
-
-    # 2. Re-process full file
-    for node in root.children:
-        if node.type in {"import_statement", "import_from_statement", "future_import_statement"}:
-            continue
-
-        if node.type == "class_definition":
-            class_code = extract_node_text(node)
-            class_name = extract_class_name(node)
-            class_description = summarize_class_with_qwen(class_code)
-
-            # Collect all method names
-            method_nodes = [
-                child for child in node.child_by_field_name("body").children
-                if child.type == "function_definition"
-            ]
-            method_names = []
-            for m in method_nodes:
-                name_node = m.child_by_field_name("name")
-                if name_node:
-                    method_names.append(extract_node_text(name_node))
-
-            # For each method, build chunk with description + other methods listed
-            for method_node in method_nodes:
-                this_method_name = extract_node_text(method_node.child_by_field_name("name"))
-                other_methods = [n for n in method_names if n != this_method_name]
-                method_decorators = extract_decorators_above(method_node)
-                method_text = extract_node_text(method_node).rstrip()
-
-                comment_lines = [
-                    f"# Method from class '{class_name}': {class_description}",
-                    f"# Other methods in class: {', '.join(other_methods) if other_methods else 'None'}"
-                ]
-
-                full_chunk = "\n".join(
-                    comment_lines + method_decorators + [method_text]
-                )
-                chunks.append(full_chunk)
-
-        elif node.type == "function_definition":
-            method_decorators = extract_decorators_above(node)
-            full_text = extract_node_text(node).rstrip()
-            chunk = "\n".join(method_decorators + [full_text])
-            chunks.append(chunk)
-
-        else:
-            node_text = extract_node_text(node).strip()
-            if node_text:
-                full_chunk = "\n".join(local_imports + [node_text])
-                chunks.append(node_text)
-
     return chunks
 

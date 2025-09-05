@@ -80,7 +80,4 @@ class GroqClient:
         raise RuntimeError(f"Max retries ({max_retries}) exceeded")
 
 
-issue = "The application crashes when submitting the form."
-files = ["data/repositories-python-practice/celery__kombu-0d3b1e254f9178828f62b7b84f0307882e28e2a0/t/__init__.py", "data/repositories-python-practice/celery__kombu-0d3b1e254f9178828f62b7b84f0307882e28e2a0/t/mocks.py", "data/repositories-python-practice/celery__kombu-0d3b1e254f9178828f62b7b84f0307882e28e2a0/t/unit/test_compat.py"]
-
 

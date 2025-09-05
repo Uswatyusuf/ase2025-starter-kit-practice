@@ -1,11 +1,8 @@
-import os
-import jsonlines
 from tree_sitter import Language, Parser
 import tree_sitter_kotlin as tskotlin
 
 KT_LANGUAGE = Language(tskotlin.language())
 parser = Parser(KT_LANGUAGE)
-
 
 def find_actual_block(node):
     # Recursively find the first function/class/object declaration inside any node
@@ -18,7 +15,7 @@ def find_actual_block(node):
     return None
 
 
-def extract_prefix_from_last_block_kt(code_bytes, caret_byte_offset):
+def extract_prefix_nearest_block_kt(code_bytes, caret_byte_offset):
     tree = parser.parse(code_bytes)
     root = tree.root_node
 
@@ -37,7 +34,7 @@ def extract_prefix_from_last_block_kt(code_bytes, caret_byte_offset):
         return code_bytes[:caret_byte_offset].decode("utf-8", errors="ignore")
 
 
-def extract_suffix_to_next_block_kt(code_bytes, caret_byte_offset):
+def extract_suffix_nearest_block_kt(code_bytes, caret_byte_offset):
     tree = parser.parse(code_bytes)
     root = tree.root_node
 
